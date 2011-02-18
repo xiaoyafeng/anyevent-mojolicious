@@ -469,8 +469,7 @@ sub on_hup {
 	
 	$h->on_eof(
 		sub {
-			my ($self, $fatal, $msg) = @_;
-			$cb->($self, $id, $msg);
+			$cb->($self, $id);
 			$self->drop($id);
 		}
 	);
