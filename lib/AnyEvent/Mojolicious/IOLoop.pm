@@ -1,15 +1,47 @@
 package AnyEvent::Mojolicious::IOLoop;
 
-$INC{'Mojo/IOLoop.pm'} = __FILE__;
-
-# We have our own implementation of Mojo::IOLoop
-package #don't index
-	Mojo::IOLoop;
-
 use strict;
 use warnings;
 
-# no warnings 'redefine';
+use Carp 'carp';
+
+# is mojo::ioloop already loaded?
+if (exists($INC{'Mojo/IOLoop.pm'})) {
+
+	# gee, we need to unload ioloop...
+	print "Unloading IOLOOP\n";
+	_unload('Mojo/IOLoop.pm');
+}
+else {
+
+	# let's just pretend that we are THE Mojo::IOLoop :)
+	#print "Faking ioloop...\n";
+}
+
+# we are THE IOLoop :P
+$INC{'Mojo/IOLoop.pm'} = __FILE__;
+
+#
+# This function is TOTALY STOLEN FROM Mojo::Loader!
+#
+sub _unload {
+	my $key = shift;
+	my $file = $INC{$key};
+	delete $INC{$key};
+	return unless $file;
+	my @subs = grep { index($DB::sub{$_}, "$file:") == 0 } keys %DB::sub;
+	for my $sub (@subs) {
+		eval { undef &$sub };
+		delete $DB::sub{$sub};
+	}
+}
+
+# We have our own implementation of Mojo::IOLoop
+package    #don't index
+  Mojo::IOLoop;
+
+use strict;
+use warnings;
 
 use base 'Mojo::Base';
 
@@ -28,6 +60,9 @@ use Socket qw/IPPROTO_TCP TCP_NODELAY SOMAXCONN SOCK_STREAM/;
 use Time::HiRes 'time';
 
 use Data::Dumper;
+
+no warnings 'redefine';
+
 
 # Debug
 use constant DEBUG => $ENV{MOJO_IOLOOP_DEBUG} || 0;
@@ -119,8 +154,8 @@ __PACKAGE__->attr(
 );
 __PACKAGE__->attr(timeout => '0.025');
 
-# Singleton
-our $LOOP;
+# singleton object
+my $_loop = undef;
 
 # is Mojo::IOLoop already overloaded/patched?
 my $_is_patched = 0;
@@ -139,14 +174,9 @@ sub DESTROY {
 }
 
 sub new {
-	my $class = shift;
-
-	print STDERR "HOHOHOHO- creating mock ioloop\n";
-
-	# Build new loop from singleton if possible
-	my $loop = $LOOP;
-	local $LOOP = undef;
-	my $self = $loop ? $loop->new(@_) : $class->SUPER::new(@_);
+	my $proto = shift;
+	my $class = ref($proto) || $proto;
+	my $self  = {};
 
 	# Ignore PIPE signal
 	$SIG{PIPE} = 'IGNORE';
@@ -157,6 +187,9 @@ sub new {
 	# AE cv...
 	$self->{_cv} = undef;
 
+	print STDERR "HOHOHOHO- creating mock ioloop\n";
+
+	bless($self, $class);
 	return $self;
 }
 
@@ -221,8 +254,12 @@ sub connection_timeout {
 	return unless my $c = $self->{_id}->{$id};
 
 	return $c->timeout() unless ($timeout);
-
-	$c->timeout($timeout);
+	
+	if ($c->isa('Guard')) {
+		
+	} else {
+		$c->timeout($timeout);
+	}
 	return $self;
 }
 
@@ -264,7 +301,10 @@ sub generate_port {
 	return;
 }
 
-sub is_running { shift->{_running} }
+sub is_running {
+	my $self = shift;
+	return (defined $self->{_cv}) ? 1 : 0;
+}
 
 # Fat Tony is a cancer on this fair city!
 # He is the cancer and I am theâ€¦ uhâ€¦ what cures cancer?
@@ -279,87 +319,33 @@ sub listen {
 	  if $args->{tls} && !TLS;
 
 	# TODO: fix id generation stuff...
-	my $id = int(rand(1000000000));
+	my $id = _newId();
 
 	#my $id = refaddr($listener);
 
+	# remove ipv6 brackets from address
+	if (defined $args->{address}) {
+		$args->{address} =~ s/[\[\]]+//g;
+	}
+
 	# create guard object...
-	my $guard = tcp_server(
+	local $@;
+	my $guard = eval {
+		tcp_server(
+			$args->{address},    # listening address
+			$args->{port},       # listening port
 
-		#undef,
-		#5555,
-		#$args->{address},
-		'::',
-		$args->{port},
+			# accept callback
+			sub { $self->_accept($args, $id, @_) },
 
-		# accept callback
-		sub {
-			my ($fh, $host, $port) = @_;
-
-			my $id = fileno($fh);
-
-			# on accept_cb?
-			if ($args->{on_accept}) {
-				$args->{on_accept}->($self, $id);
-			}
-
-			#print STDERR "accept cb: ", join(", ",  @_), "\n";
-			# create handle object
-			my $c = AnyEvent::Handle->new(
-				fh         => $fh,
-				timeout    => 10,
-				on_timeout => sub {
-					my ($h) = @_;
-
-					#print STDERR "ON_TIMEOUT: @_\n";
-					$h->destroy();
-					undef $h;
-				},
-				on_eof => sub {
-					my ($h) = @_;
-
-					#print STDERR "ON_EOF: @_\n";
-					$args->{on_hup}->($self, $id) if ($args->{on_hup});
-					$h->destroy();
-				},
-				on_error => sub {
-					my ($h, $fatal, $msg) = @_;
-					print STDERR "ON_ERROR: @_\n";
-					$args->{on_error}->($self, $id, $msg)
-					  if ($args->{on_error});
-					$h->destroy();
-				},
-				on_read => sub {
-					my ($h) = @_;
-					
-					# print "Read from $h\n";
-
-					#my $id = refaddr($h);
-					#print STDERR "ON_READ [$id]: $h\n";
-					my $buf = $h->{rbuf};
-					$h->{rbuf} = '';
-
-					#print "handle: ", Dumper($_[0]), "\n";
-					if ($args->{on_read}) {
-
-						#print "Invoking read_cbbbbb\n";
-						$args->{on_read}->($self, $id, $buf);
-					}
-				}
-			);
-
-			#my $i = refaddr($c);
-
-			# save handle...
-			$self->{_id}->{$id} = $c;
-
-			#print "saved handle as id: $id\n";
-
-		},
-		sub {
-			print "setup_CB\n";
-		},
-	);
+			# prepare callback
+			sub { $self->_listen_prepare($id, @_) },
+		);
+	};
+	if ($@) {
+		croak "Error creating listening socket: $@";
+		return undef;
+	}
 
 	# save listener...
 	$self->{_id}->{$id} = $guard;
@@ -387,9 +373,18 @@ sub local_info {
 
 	# Connection
 	return {} unless my $c = $self->{_id}->{$id};
+	
+	my $socket = undef;
+	if ($c->isa('Guard')) {
+	}
+	elsif ($c->isa('AnyEvent::Handle')) {
+		$socket = $c->fh();
+	} else {
+		
+	}
 
 	# Socket
-	return {} unless my $socket = $c->fh();
+	return {} unless (defined $socket);
 
 	# UNIX domain socket info
 	return {path => $socket->hostpath} if $socket->can('hostpath');
@@ -430,7 +425,7 @@ sub resolve {
 
 	$res->resolve(
 		$name, '*',
-		accept => [ lc($type) ],
+		accept => [lc($type)],
 		sub {
 			my @addrs = ();
 			if (defined $_[0] && ref($_[0]) eq 'ARRAY') {
@@ -443,11 +438,87 @@ sub resolve {
 	);
 }
 
-sub on_error { print "on_error: @_\n"; shift->_add_event('error', @_) }
-sub on_hup   { print "on_hup: @_\n";   shift->_add_event('hup',   @_) }
-sub on_idle  { print "on_idle: @_\n"; }
-sub on_read  { print "on_read: @_\n"; }
-sub on_tick  { print "on_tick: @_\n"; }
+sub on_error {
+	my ($self, $id, $cb) = @_;
+	print STDERR "on_error(): id=$id, cb=$cb\n" if (DEBUG);
+	return undef unless (defined $cb && ref($cb) eq 'CODE');
+	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
+	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+
+	weaken $self;
+
+	# set ...
+	$h->on_error(sub {
+		# fire callback
+		$cb->($self, $id, $_[2]);
+		# drop the handle
+		$self->drop($id);
+	});
+
+	return $self;
+}
+
+sub on_hup {
+	my ($self, $id, $cb) = @_;
+	print STDERR "on_hup(): id=$id, cb=$cb\n" if (DEBUG);
+	return undef unless (defined $cb && ref($cb) eq 'CODE');
+	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
+	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+
+	weaken $self;
+	
+	$h->on_eof(
+		sub {
+			my ($self, $fatal, $msg) = @_;
+			$cb->($self, $id, $msg);
+			$self->drop($id);
+		}
+	);
+
+}
+sub on_idle {
+	print "on_idle: @_\n";
+}
+
+sub on_read {
+	my ($self, $id, $cb) = @_;
+	print STDERR "on_read(): id=$id, cb=$cb\n" if (DEBUG);
+	return undef unless (defined $cb && ref($cb) eq 'CODE');
+	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
+	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+
+	weaken $self;
+
+	$h->on_read(
+		sub {
+			my ($h) = @_;
+			my $buf = $h->{rbuf};
+			$h->{rbuf} = '';
+			$cb->($self, $id, $buf);
+		}
+	);
+	print STDERR "  on_read(): callback set.\n" if (DEBUG);
+}
+
+sub on_timeout {
+	my ($self, $id, $cb) = @_;
+	print STDERR "on_timeout(): id=$id, cb=$cb\n" if (DEBUG);
+	return undef unless (defined $cb && ref($cb) eq 'CODE');
+	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
+	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+
+	weaken $self;
+
+	$h->on_timeout(
+		sub { $cb->($self, $id) }
+	);
+	print STDERR "  on_timeout(): callback set.\n" if (DEBUG);
+}
+
+
+sub on_tick {
+	print "on_tick: @_\n";
+}
 
 sub one_tick {
 	my ($self, $timeout) = @_;
@@ -459,17 +530,31 @@ sub remote_info {
 	# Connection
 	return {} unless my $c = $self->{_id}->{$id};
 
+	my $socket = undef;
+	if ($c->isa('Guard')) {
+	}
+	elsif ($c->isa('AnyEvent::Handle')) {
+		$socket = $c->fh();
+	} else {
+		
+	}
+
 	# Socket
-	return {} unless my $socket = $c->{handle};
+	return {} unless (defined $socket);
 
 	# UNIX domain socket info
 	return {path => $socket->peerpath} if $socket->can('peerpath');
 
 	# Info
-	return {address => $socket->peerhost, port => $socket->peerport};
+	return {address => $socket->peerhost, port => $socket->peerport} if ($socket->can('peerhost'));
 }
 
-sub singleton { $LOOP ||= shift->new(@_) }
+sub singleton {
+	unless (defined $_loop) {
+		$_loop = __PACKAGE__->new();
+	}
+	return $_loop;
+}
 
 sub start {
 	my $self = shift;
@@ -503,7 +588,7 @@ sub start_tls {
 sub stop {
 	my $self = shift;
 	return $self unless (defined $self->{_cv});
-	
+
 	$self->{_cv}->send();
 	return $self;
 }
@@ -532,29 +617,15 @@ sub test {
 }
 
 # compatibility method for Mojo::Server::Daemon
-sub _drop_immediately {
-	my ($self, $id) = @_;
-	return $self->drop($id);
-}
+sub _drop_immediately { drop(@_) }
 
 sub timer {
 	my ($self, $after, $cb) = @_;
 	return undef unless (defined $cb && ref($cb) eq 'CODE');
-	my $id = _newId();
 
 	# create AnyEvent timer
-	my $timer = AnyEvent->timer(
-		after => $after,
-		cb    => sub {
-
-			# drop timer...
-			undef $self->{_id}->{$id};
-			delete($self->{_id}->{$id});
-
-			# invoke callback...
-			$cb->();
-		},
-	);
+	my $timer = AE::timer($after, 0, $cb);
+	my $id = refaddr($timer);
 
 	# save timer
 	$self->{_id}->{$id} = $timer;
@@ -616,21 +687,23 @@ sub _prepare_key {
 
 sub patch {
 	return 1 if ($_is_patched);
-	
+
 	if (exists($INC{'Mojo/IOLoop.pm'})) {
 		print "IOLoop is already loaded, will replace it's methods.\n";
 		$INC{'Mojo/IOLoopOrig.pm'} = $INC{'Mojo/IOLoop.pm'};
-	} else {
+	}
+	else {
 		print "IOLoop is NOT loaded, will create it...\n";
 		$INC{'Mojo/IOLoop.pm'} = __FILE__;
 	}
 
 
 	use Data::Dumper;
+
 	#$Data::Dumper::Indent = 0;
 	#$Data::Dumper::Terse = 1;
-	
-	print "PKG: ", Dumper(\ %{AnyEvent::Mojolicious::IOLoop::}), "\n";
+
+	print "PKG: ", Dumper(\%{AnyEvent::Mojolicious::IOLoop::}), "\n";
 
 	# copy subs...
 	for (keys %{AnyEvent::Mojolicious::IOLoop::}) {
@@ -642,7 +715,7 @@ sub patch {
 		my $sub = undef;
 		eval { $sub = *{$AnyEvent::Mojolicious::IOLoop::{$_}{CODE}} };
 		next if ($@);
-		
+
 		print "SUB: $sub :: ", Dumper($sub), "\n";
 
 		next;
@@ -654,6 +727,47 @@ sub patch {
 
 sub _newId {
 	return sprintf("%-.7d", int(time()) + int(rand(10000000)));
+}
+
+sub _accept {
+	my ($self, $args, $id, $fh, $host, $port) = @_;
+	print STDERR "_accept(): id=$id, fh=$fh, host=$host, port=$port\n" if (DEBUG);
+
+	weaken $self;
+
+	# tls stuff?
+
+	#print STDERR "accept cb: ", join(", ",  @_), "\n";
+	# create handle object
+	my $c = AnyEvent::Handle->new(
+		fh         => $fh,
+		# timeout    => 10000,
+	);
+	my $cid = refaddr($c);
+	
+	# save connection
+	$self->{_id}->{$cid} = $c;
+	
+	# apply callbacks...
+	foreach my $k (keys %{$args}) {
+		next unless ($k =~ m/^on_/);
+		#print "  _accept(): setting $k\n" if (DEBUG);
+		if ($self->can($k)) {
+			$self->$k($cid, $args->{$k});
+		}
+	}
+
+	# on accept_cb?
+	if ($args->{on_accept}) {
+		$args->{on_accept}->($self, $cid);
+	}
+
+	print STDERR "_accept(): Accepted new connection id: $cid\n" if (DEBUG);
+}
+
+sub _listen_prepare {
+	my ($self, $id, $fh, $host, $port) = @_;
+	print STDERR "_accept_prepare(): id=$id, fh=$fh, host=$host, port=$port\n" if (DEBUG);
 }
 
 1;
