@@ -1,43 +1,72 @@
-=head1 AnyEvent::Mojolicious
+=head1 NAME
 
-This project is a port of L<Mojo::IOLoop> to L<AnyEvent> event framework.
+This is a port of L<Mojo::IOLoop> to L<AnyEvent> event framework;
 
-This package is currently in alpha phase. Don't use it until it's finished.
+=head1 AnyEvent?
+
+L<AnyEvent> is coolest event loop available for perl. You want to
+use it in your Mojo apps :)
+
+=head1 Why should i care?
+
+Becouse you get all the goodies that come with L<AnyEvent> (TLS, IPv6 support,
+lots of modules) into your L<Mojolicious> webapps, or you get really cool
+HTTP/1.1 websocket enabled http server/client (L<Mojo::Server::Daemon>, 
+L<Mojo::Client>) if you want to incorporate some L<Mojo|Mojolicious> into
+your L<AnyEvent> applications
 
 =head1 SYNOPSIS
+
+Put the following in B<myapp.pl>:
 
  #!/usr/bin/perl
  
  use strict;
  use warnings;
  
- use FindBin;
- use File::Spec;
- 
- # add AnyEvent::Mojolicious to @INC
- use lib "/path/to/anyevent-mojolicious/lib";
-
- # this is still needed :(
- use AnyEvent::Mojolicious::IOLoop;
  use Mojolicious::Lite;
 
  get '/' => sub {
-        my ($self) = @_;
-        #app->log->info("This is funny :)");
-
-        #return $self->render_data("hello world");
-        return $self->render_json({ a => 19, b => 20 });
+   my ($self) = @_;
  };
  
- # print "APP: ", Dumper(app), "\n";
- 
- app->secret(rand());
+ # some AnyEvent stuff!
+ get '/ae' => sub {
+   my $self = shift;
+   # already loaded, this for demonstration
+   # purposes only, so that you can run
+   # this app under normal mojo server to
+   # find out that /ae location doesn't work 
+   require AnyEvent;
+ 	
+   my $delay = rand(1.3);
+ 	
+   # delay response using AnyEvent timer:
+   my $t = AnyEvent->timer(
+ 	 after => $delay,
+     cb => sub {
+       $self->render_data("Delayed response ($delay) by AnyEvent");
+ 	 },
+   );
+   
+   # the same with AE api:
+   # my $t = AE::timer(
+   #   $delay, 0,
+   #   sub {
+   #     $self->render_data("Delayed response ($delay) by AnyEvent");
+   #   }
+   # );
+ 	
+   # save timer to stash
+   $self->stash(timer => $t);
+ };
  
  # Start the Mojolicious command system
  app->start;
 
-# start the application:
- ./myapp.pl daemon_anyevent
+Just start your webapplication with B<daemon_anyevent> argument instead daemon:
+
+ $ ./myapp.pl daemon_anyevent
 
 =head1 INSTALLATION
 
