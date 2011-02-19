@@ -63,6 +63,8 @@ use constant TLS => $ENV{MOJO_NO_TLS}
   ? 0
   : eval 'use AnyEvent::TLS; 1';
 
+use constant WINDOWS => ($^O =~ m/win/i) ? 1 : 0; 
+
 # Default TLS cert (20.03.2010)
 # (openssl req -new -x509 -keyout cakey.pem -out cacert.pem -nodes -days 7300)
 use constant CERT => <<EOF;
@@ -414,11 +416,11 @@ sub listen {
     $port = delete($args->{port}) || 3000;
   }
 
-  my $on_accept = delete($args->{on_accept});
-  unless (ref($on_accept) eq 'CODE') {
-    croak "No on_accept defined!";
-    return;
-  }
+  my $on_accept = delete($args->{on_accept}) || undef;
+  #unless (ref($on_accept) eq 'CODE') {
+  #  croak "No on_accept defined!";
+  #  return;
+  #}
 
   # create tcp server
   $listen->{g} = tcp_server(
@@ -476,7 +478,7 @@ sub listen {
       }
 
       # fire on_accept handler!
-      $on_accept->($self, $cid);
+      $on_accept->($self, $cid) if ($on_accept);
     },
 
     # prepare cb
@@ -543,15 +545,18 @@ sub on_error {
 
   weaken $self;
 
-  # set callback
-  $h->on_error(
-    sub {
+  my $rcb = sub {
       my ($hdl, $fatal, $msg) = @_;
-      print STDERR ref($self), " error on $id: $msg\n" if DEBUG;
-      $cb->($self, $id, $msg);
-      $self->drop($id);
-    }
-  );
+      print STDERR ref($self), " on_error() on $id: $msg\n" if DEBUG;
+      $self->_drop_immediately($id);
+      $cb->($self, $id, $msg); 
+  };
+
+  # set callback
+  $h->on_error($rcb);
+  
+  # save error callback...
+  $self->{_cs}->{$id}->{error_cb} = $rcb; 
 
   return $self;
 }
@@ -775,19 +780,28 @@ sub start_tls {
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
 
-  my $opt = {
-    sslv2 => 0,
-    sslv3 => 1,
-    tlsv1 => 1,
+  # create TLS ctx
+  local $@;
+  my $ctx = eval {
+    my %opt = (
+	  sslv2 => 0,
+   	  sslv3 => 1,
+  	  tlsv1 => 1,
+  	);
+	  # key/cert
+	  $opt{key_file}  = $args->{tls_key} if ($args->{tls_key});
+	  $opt{cert_file} = $args->{tls_cert} if ($args->{tls_cert});
+  	
+  	# now really create context...
+  	AnyEvent::TLS->new(%opt);
   };
-  
-
-  # key/cert
-  $opt->{key_file}  = $args->{tls_key} if ($args->{tls_key});
-  $opt->{cert_file} = $args->{tls_cert} if ($args->{tls_cert});
+  if ($@) {
+  	$self->_error($id, 'TLS context creation exception: ' . $@);
+  	return;
+  }
 
   # start tls...
-  $h->starttls('connect', $opt);
+  $h->starttls('connect', $ctx);
 
   return $id;
 }
@@ -849,19 +863,17 @@ sub _error {
   return unless my $c = $self->{_cs}->{$id};
 
   # Get error callback
-  my $event = $c->{error};
+  my $cb = $c->{error_cb};
 
   # Cleanup
   $self->_drop_immediately($id);
 
   # Error
   $error ||= 'Unknown error, probably harmless.';
+  
+  # run callback
+  $cb->(undef, 1, $error);
 
-  # No event
-  warn "Unhandled event error: $error" and return unless $event;
-
-  # Error callback
-  $self->_run_event('error', $event, $id, $error);
 }
 
 sub _prepare_cert {
