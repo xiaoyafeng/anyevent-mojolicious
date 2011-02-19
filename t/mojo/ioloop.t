@@ -7,10 +7,10 @@ use Test::More tests => 8;
 
 use_ok 'AnyEvent::Mojolicious::IOLoop';
 
-# Marge, you being a cop makes you the man!
-# Which makes me the woman, and I have no interest in that,
-# besides occasionally wearing the underwear,
-# which as we discussed, is strictly a comfort thing.
+# "Marge, you being a cop makes you the man!
+#  Which makes me the woman, and I have no interest in that,
+#  besides occasionally wearing the underwear,
+#  which as we discussed, is strictly a comfort thing."
 my $loop = Mojo::IOLoop->new;
 
 # Ticks
@@ -21,18 +21,16 @@ my $id = $loop->on_tick(sub { $ticks++ });
 my $flag = 0;
 my $flag2;
 $loop->timer(
-    1 => sub {
-        my $self = shift;
-        $self->timer(
-            1 => sub {
-		#print STDERR "stopping loop\n";
-                shift->stop;
-		#print STDERR "LOOP stopped\n";
-                $flag2 = $flag;
-            }
-        );
-        $flag = 23;
-    }
+  1 => sub {
+    my $self = shift;
+    $self->timer(
+      1 => sub {
+        shift->stop;
+        $flag2 = $flag;
+      }
+    );
+    $flag = 23;
+  }
 );
 
 # HiRes timer
@@ -75,12 +73,12 @@ is $ticks, $before, 'no additional ticks';
 my $port = Mojo::IOLoop->generate_port;
 my $handle;
 $loop->listen(
-    port      => $port,
-    on_accept => sub { $handle = shift->handle(pop) }
+  port      => $port,
+  on_accept => sub { $handle = shift->handle(pop) }
 );
 $loop->connect(
-    address => 'localhost',
-    port    => $port,
+  address => 'localhost',
+  port    => $port,
 );
 $loop->timer('0.5' => sub { shift->stop });
 $loop->start;
