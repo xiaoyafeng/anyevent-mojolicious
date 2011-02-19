@@ -146,6 +146,14 @@ sub new {
   my $loop = $LOOP;
   local $LOOP = undef;
   my $self = $loop ? $loop->new(@_) : $class->SUPER::new(@_);
+  
+  # on_idle callback subs
+  $self->{_idle} = {};
+  $self->{_idle_ae} = undef;
+  
+  # on_tick callback subs
+  $self->{_tick} = {};
+  $self->{_tick_ae} = undef;
 
   # Ignore PIPE signal
   $SIG{PIPE} = 'IGNORE';
@@ -243,6 +251,12 @@ sub connect {
           my $event = "on_$name";
           $self->$event($id => $cb) if $cb;
         }
+        
+        # do we have connection timeout set somewhere?
+        if (defined (my $to = $self->{_cs}->{$id}->{timeout})) {
+        	# print STDERR ref($self), " connect(): setting pre-connect-ok set connection_timeout: $id => $to\n" if DEBUG;
+        	$self->connection_timeout($id, $to);
+        }
 
         # TLS?
         if ($args->{tls}) { $self->start_tls($id => $args) }
@@ -257,26 +271,69 @@ sub connect {
       }
     );
   }
-
+  
+  print STDERR ref($self), " connect(): created connection: $id\n" if DEBUG;
   return $id;
 }
 
 sub connection_timeout {
   my ($self, $id, $timeout) = @_;
-  return unless (defined $id && exists($self->{_cs}->{$id}));
+  return unless (defined $id && exists($self->{_cs}->{$id}) && ref($self->{_cs}->{$id}) eq 'HASH');
   my $h = $self->{_cs}->{$id}->{h};
-  return unless ($h);
-
-  if ($timeout) {
-    $h->timeout($timeout);
-    return $self;
+  
+  # check if connection is already established...
+  if (defined $h) {
+  	if ($timeout) {
+	  	print STDERR ref($self), " connection_timeout(): Setting connection timeout $id => $timeout\n" if DEBUG;
+  		$h->timeout($timeout);
+  		$self->{_cs}->{$id}->{timeout} = $timeout;
+  	}
+  	return $self->{_cs}->{$id}->{timeout};
   }
-
-  return $h->timeout();
+  # nope, handle is not there yet,
+  # connect() will set timeout if connect will succeed.
+  else {
+    if ($timeout) {
+      print STDERR ref($self), " connection_timeout(): Setting DELAYED connection timeout $id => $timeout\n" if DEBUG;
+  	  $self->{_cs}->{$id}->{timeout} = $timeout;
+    }
+  	return $self->{_cs}->{$id}->{timeout};
+  }
 }
 
 sub drop {
   my ($self, $id) = @_;
+  return unless (defined $id);
+  
+  # on_idle callback id?
+  if (exists $self->{_idle}->{$id}) {
+  	delete($self->{_idle}->{$id});
+  	return;
+  }
+  
+  # on_tick callback id?
+  if (exists $self->{_tick}->{$id}) {
+  	delete($self->{_tick}->{$id});
+  	return;
+  }
+  
+  my $c = $self->{_cs}->{$id};
+  return 0 unless (defined $id);
+  
+  # we want to gracefully drop a connection
+  if (ref($c) eq 'HASH' && defined $c->{h}) {	
+  	weaken $self;
+  	$c->{h}->on_drain(sub { $self->_drop_immediately($id) });
+  	return;
+  }
+  
+  # relentlessly drop this one...
+  $self->_drop_immediately($id);
+}
+
+sub _drop_immediately {
+  my ($self, $id) = @_;
+
   my $c = $self->{_cs}->{$id};
   return 0 unless (defined $id);
 
@@ -293,20 +350,9 @@ sub drop {
     }
   }
 
-  # drop it...
+  # drop everything...
   delete($self->{_cs}->{$id});
-
-=pod
-  # Drop connection gracefully
-  if (my $c = $self->{_cs}->{$id}) { return $c->{finish} = 1 }
-
-  # Drop
-  return $self->_drop_immediately($id);
-=cut
-
 }
-
-sub _drop_immediately { drop(@_) }
 
 sub generate_port {
   my $self = shift;
@@ -384,7 +430,7 @@ sub listen {
 
       # TODO: handle max_accepts!
       my ($fh, $host, $port) = @_;
-      print "accept: $fh, $host, $port\n" if DEBUG;
+      print STDERR ref($self), " accept: $fh, $host, $port\n" if DEBUG;
 
       # time to create client handle!
       my $ch = AnyEvent::Handle->new(fh => $fh, no_delay => 1);
@@ -501,7 +547,7 @@ sub on_error {
   $h->on_error(
     sub {
       my ($hdl, $fatal, $msg) = @_;
-      print "error on $id: $msg\n" if DEBUG;
+      print STDERR ref($self), " error on $id: $msg\n" if DEBUG;
       $cb->($self, $id, $msg);
       $self->drop($id);
     }
@@ -512,32 +558,76 @@ sub on_error {
 
 sub on_hup {
   my ($self, $id, $cb) = @_;
+  return unless (defined $cb && ref($cb) eq 'CODE');
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
 
   weaken $self;
-
-  # set callback
-  $h->on_eof(
-    sub {
+  
+  # create own sub wrapper
+  my $rcb = sub {
       my ($hdl) = @_;
-      print "hup on $id\n" if DEBUG;
+      print STDERR ref($self), " on_hup(): HUP on $id\n" if DEBUG;
+      $self->_drop_immediately($id);
       $cb->($self, $id);
-      $self->drop($id);
     }
-  );
+  ; 
+
+  # set EOF and Timeout callback (the REAL Mojo::IOLoop made me do it!)
+  $h->on_eof($rcb);
+  $h->on_timeout($rcb);
 
   return $self;
 }
 
 sub on_idle {
   my ($self, $cb) = @_;
-  print "idle\n" if (DEBUG);
-  my $idle = AE::idle $cb;
-  my $id   = refaddr($idle);
-  $self->{_cs}->{$id} = $idle;
-  return $self;
+  return unless (defined $cb && ref($cb) eq 'CODE');
+  print STDERR ref($self), " on_idle: $cb\n" if DEBUG;
+  
+  # save callback...
+  my $id = refaddr($cb);
+  $self->{_idle}->{$id} = $cb;
+  
+  # AE callback...
+  weaken $self;
+  $self->{_idle_ae} = AE::idle sub { $self->_do_on_idle() };
+  
+  return $id;
+}
+
+sub _do_on_idle {
+	my $self = shift;
+	
+	# no on_idle callbacks?
+	unless (%{$self->{_idle}}) {
+		# drop the goddamn idle callback from AE
+		$self->{_idle_ae} = undef;
+		return;
+	}
+
+	# run callbacks...
+	weaken $self;
+	foreach (values %{$self->{_idle}}) { $_->($self) }	
+}
+
+sub _do_on_tick {
+	my $self = shift;
+	
+	#use Data::Dumper;
+	#print STDERR ref($self), " _do_on_tick: ", Dumper($self->{_tick}), "\n";
+	
+	# no on_tick callbacks?
+	unless (%{$self->{_tick}}) {
+		# drop the goddamn tick callback from AE
+		$self->{_tick_ae} = undef;
+		return;
+	}
+	
+	# run on_tick callbacks
+	weaken $self;
+	foreach (values %{$self->{_tick}}) { $_->($self) }
 }
 
 sub on_read {
@@ -551,7 +641,7 @@ sub on_read {
   # set callback
   $h->on_read(
     sub {
-      print "read on $id\n" if DEBUG;
+      print STDERR ref($self), " read on $id\n" if DEBUG;
       my ($h) = @_;
       $cb->($self, $id, $h->{rbuf});
       $h->{rbuf} = '';
@@ -563,29 +653,39 @@ sub on_read {
 
 sub on_tick {
   my ($self, $cb) = @_;
-  if ($cb && $self->timeout) {
-    my $c = {
-      g => undef,
-      t => AE::timer(0.01, $self->timeout(), $cb)
-    };
-    my $id = refaddr($c);
-    $self->{_cs}->{$id} = $c;
-  }
+  return unless (defined $cb && ref($cb) eq 'CODE');
 
-  #croak 'on_tick is not supported in ' . ref($self);
-  return $self;
+  # save callback
+  my $id = refaddr($cb);
+  $self->{_tick}->{$id} = $cb;
+  
+  # timeout?
+  my $timeout = $self->timeout();
+  return $id unless (defined $timeout && $timeout > 0);
+
+  # create AE timer to emulate timer ticks...
+  $self->{_tick_ae} = AE::timer(0.01, $timeout, sub { $self->_do_on_tick() });
+
+  return $id;
 }
 
 sub one_tick {
   my ($self, $timeout) = @_;
-  croak 'one_tick is not supported in ' . ref($self);
+  # This is fucking ridiculous...
+  # There is no "one_tick" concept in AnyEvent API.
+  
+  # well, however, let's just run on_tick
+  # on_idle callbacks...
+  $self->_do_on_tick();
+  $self->_do_on_idle();
 }
 
 sub handle {
   my ($self, $id) = @_;
   return unless my $c = $self->{_cs}->{$id};
   return unless (ref($c) eq 'HASH' && $c->{h});
-  return $c->{h}->fh();
+  eval { require IO::Socket::INET };
+  return IO::Socket::INET->new_from_fd(fileno($c->{h}->fh), 'r+');
 }
 
 sub remote_info {
@@ -620,7 +720,7 @@ sub resolve {
     sub {
 
       #use Data::Dumper;
-      #print STDERR "RESOLVE CB_ ", Dumper(\ @_), "\n";
+      #print STDERR ref($self), " RESOLVE CB_ ", Dumper(\ @_), "\n";
       my $res = [];
       map { push(@{$res}, [$_->[1], $_->[3]]) } $_[0];
 
@@ -650,7 +750,7 @@ sub start {
   $self->{_cv}->recv();
   delete($self->{_cv});
 
-  print "LOOP $self started!\n" if DEBUG;
+  print STDERR ref($self), " LOOP $self started!\n" if DEBUG;
   return $self;
 }
 
@@ -680,10 +780,11 @@ sub start_tls {
     sslv3 => 1,
     tlsv1 => 1,
   };
+  
 
   # key/cert
   $opt->{key_file}  = $args->{tls_key} if ($args->{tls_key});
-  $opt->{cert_file} = $args->{tls_key} if ($args->{tls_cert});
+  $opt->{cert_file} = $args->{tls_cert} if ($args->{tls_cert});
 
   # start tls...
   $h->starttls('connect', $opt);
@@ -697,7 +798,7 @@ sub stop {
   return unless (defined $self->{_cv});
 
   $self->{_cv}->send();
-  delete($self->{_cv});
+  #delete($self->{_cv});
   $self->{_running} = 0;
 }
 
@@ -709,8 +810,7 @@ sub test {
 sub timer {
   my ($self, $after, $cb) = @_;
   weaken $self;
-  my $t =
-    AE::timer($after, 0, sub { print STDERR "exec timer.\n"; $cb->($self) });
+  my $t = AE::timer($after, 0, sub { $cb->($self) });
   my $id = refaddr($t);
 
   # save it...
@@ -724,14 +824,20 @@ sub write {
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
 
-  # write done callback...
-  if ($cb) {
-    $h->on_drain(sub { $cb->($self, $id) });
-  }
-
   # add chunk for writing...
   $h->push_write($chunk);
 
+  # write done callback...
+  if (ref($cb) eq 'CODE') {
+  	weaken $self;
+    $h->on_drain(sub {
+    		# remove on_drain cb on handle...
+    		$_[0]->on_drain(undef);
+    		# run the callback...
+    		$cb->($self, $id);
+    	}
+    );
+  }
 
   return $self;
 }
