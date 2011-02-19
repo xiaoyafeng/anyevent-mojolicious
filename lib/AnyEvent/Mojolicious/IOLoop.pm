@@ -7,9 +7,6 @@ use Carp 'carp';
 
 # is mojo::ioloop already loaded?
 if (exists($INC{'Mojo/IOLoop.pm'})) {
-
-	# gee, we need to unload ioloop...
-	print "Unloading IOLOOP\n";
 	_unload('Mojo/IOLoop.pm');
 }
 else {
@@ -25,7 +22,7 @@ $INC{'Mojo/IOLoop.pm'} = __FILE__;
 # This function is TOTALY STOLEN FROM Mojo::Loader!
 #
 sub _unload {
-	my $key = shift;
+	my $key  = shift;
 	my $file = $INC{$key};
 	delete $INC{$key};
 	return unless $file;
@@ -36,43 +33,35 @@ sub _unload {
 	}
 }
 
-# We have our own implementation of Mojo::IOLoop
-package    #don't index
-  Mojo::IOLoop;
+package Mojo::IOLoop;
 
 use strict;
 use warnings;
 
-use base 'Mojo::Base';
+# omfg!
+no warnings 'redefine';
+
+use Carp 'croak';
+use File::Spec;
+use IO::File;
+use Scalar::Util qw(weaken refaddr blessed);
 
 use AnyEvent;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
 use AnyEvent::DNS;
 
-use Carp 'croak';
-use File::Spec;
-use IO::File;
-use List::Util 'first';
-use Mojo::URL;
-use Scalar::Util qw(weaken refaddr);
-use Socket qw/IPPROTO_TCP TCP_NODELAY SOMAXCONN SOCK_STREAM/;
-use Time::HiRes 'time';
+# use Socket qw(IPPROTO_TCP TCP_NODELAY SO_REUSEADDR);
 
-use Data::Dumper;
-
-no warnings 'redefine';
-
+use base 'Mojo::Base';
 
 # Debug
 use constant DEBUG => $ENV{MOJO_IOLOOP_DEBUG} || 0;
 
+# TLS support requires IO::Socket::SSL
 use constant TLS => $ENV{MOJO_NO_TLS}
   ? 0
   : eval 'use AnyEvent::TLS; 1';
-
-# Windows
-use constant WINDOWS => $^O eq 'MSWin32' ? 1 : 0;
 
 # Default TLS cert (20.03.2010)
 # (openssl req -new -x509 -keyout cakey.pem -out cacert.pem -nodes -days 7300)
@@ -120,51 +109,26 @@ AnqxHi90n/p912ynLg2SjBq+03GaECeGzC/QqKK2gtA=
 -----END RSA PRIVATE KEY-----
 EOF
 
-# DNS server (default to Google Public DNS)
-our $DNS_SERVER = '8.8.8.8';
-
-# Try to detect DNS server
-if (-r '/etc/resolv.conf') {
-	my $file = IO::File->new;
-	$file->open('< /etc/resolv.conf');
-	for my $line (<$file>) {
-		if ($line =~ /^nameserver\s+(\S+)$/) {
-
-			# New DNS server
-			$DNS_SERVER = $1;
-
-			# Debug
-			#warn qq/DETECTED DNS SERVER ($DNS_SERVER)\n/ if DEBUG;
-		}
-	}
-}
-
-# "localhost"
-our $LOCALHOST = '127.0.0.1';
-
-
 __PACKAGE__->attr([qw/accept_timeout connect_timeout dns_timeout/] => 3);
-__PACKAGE__->attr(dns_server => sub { $ENV{MOJO_DNS_SERVER} || $DNS_SERVER });
+__PACKAGE__->attr(dns_server => sub { $ENV{MOJO_DNS_SERVER} });
 __PACKAGE__->attr(max_accepts     => 0);
 __PACKAGE__->attr(max_connections => 1000);
-__PACKAGE__->attr(
-	[qw/on_lock on_unlock/] => sub {
-		sub {1}
-	}
-);
+__PACKAGE__->attr([qw/on_lock on_unlock/] => sub {
+	sub {1}
+});
 __PACKAGE__->attr(timeout => '0.025');
 
-# singleton object
-my $_loop = undef;
-
-# is Mojo::IOLoop already overloaded/patched?
-my $_is_patched = 0;
+# Singleton
+our $LOOP;
 
 sub DESTROY {
 	my $self = shift;
 
 	# Cleanup connections
-	for my $id (keys %{$self->{_id}}) { $self->drop($id) }
+	for my $id (keys %{$self->{_cs}}) { $self->_drop_immediately($id) }
+
+	# Cleanup listen sockets
+	for my $id (keys %{$self->{_listen}}) { $self->_drop_immediately($id) }
 
 	# Cleanup temporary cert file
 	if (my $cert = $self->{_cert}) { unlink $cert if -w $cert }
@@ -174,74 +138,122 @@ sub DESTROY {
 }
 
 sub new {
-	my $proto = shift;
-	my $class = ref($proto) || $proto;
-	my $self  = {};
+	my $class = shift;
+
+	# Build new loop from singleton if possible
+	my $loop = $LOOP;
+	local $LOOP = undef;
+	my $self = $loop ? $loop->new(@_) : $class->SUPER::new(@_);
 
 	# Ignore PIPE signal
 	$SIG{PIPE} = 'IGNORE';
-
-	# opened handles and timers...
-	$self->{_id} = {};
-
-	# AE cv...
-	$self->{_cv} = undef;
-
-	print STDERR "HOHOHOHO- creating mock ioloop\n";
-
-	bless($self, $class);
 	return $self;
 }
 
 sub connect {
 	my $self = shift;
-	print "connect called.\n";
 
 	# Arguments
 	my $args = ref $_[0] ? $_[0] : {@_};
 
-	# TLS check
-	return undef if $args->{tls} && !TLS;
-
 	# Protocol
 	$args->{proto} ||= 'tcp';
 
-	# create handle options
-	my %opt = (
-		fh => delete($args->{handle}) || undef,
-		connect => [delete($args->{address}), delete($args->{port})],
-		tls => ($args->{tls}) ? 'connect' : undef,
-	);
-
-	# no handle?
-	unless (defined $opt{fh}) {
-		$opt{connect} = [$args->{address}, $args->{port}];
-		delete($opt{fh});
+	if (lc($args->{proto}) ne 'tcp') {
+		croak "Unsupported protocol: $args->{proto}";
 	}
 
-	my $id = undef;
+	# connection structure
+	my $conn = {
+		g => undef,    # guard object
+		h => undef,    # handle object
+	};
 
-	# on_connect
-	if ($args->{on_connect} && ref($args->{on_connect}) eq 'CODE') {
-		$opt{on_connect} = sub {
-			$args->{on_connect}->($self, $id);
-		};
+	# compute id and save it
+	my $id = refaddr($conn);
+	$self->{_cs}->{$id} = $conn;
+
+	my $on_connect = delete($args->{on_connect});
+	$on_connect = undef unless (ref($on_connect) eq 'CODE');
+
+	# do we have handle?
+	my $handle = delete($args->{handle}) || delete($args->{socket}) || undef;
+
+	# socket/handle?
+	if (defined $handle) {
+
+		# create anyevent handle right away!
+		$self->{_cs}->{$id}->{h} = AnyEvent::Handle->new(
+			fh       => $handle,
+			no_delay => 1,
+		);
+		$self->{_cs}->{$id}->{h}->on_connect(sub { $on_connect->($self, $id) })
+		  if ($on_connect);
+
+		# register callbacks
+		for my $name (qw/error hup read/) {
+			my $cb    = $args->{"on_$name"};
+			my $event = "on_$name";
+			$self->$event($id => $cb) if $cb;
+		}
 	}
 
-	# create new anyevent handle
-	my $h = AnyEvent::Handle->new(%opt);
+	# nop, someone wants real connection
+	else {
 
-	# generate id (refaddr is 2x faster than regex)
-	$id = refaddr($h);
+		# Remove [] from address (ipv6 stuff)
+		$args->{address} =~ s/[\[\]]+//g;
 
-	# save handle
-	$self->{_id}->{$id} = $h;
+		# create connection guard...
+		$conn->{g} = tcp_connect(
+			$args->{address},
+			$args->{port},
 
-	# callbacks...
-	for my $name (qw(error hup read)) {
-		my $cb    = $args->{"on_$name"};
-		my $event = "on_$name";
-		$self->$event($id, $cb) if (defined $cb);
+			# connect callback
+			sub {
+				my ($fh, $host, $port, $retry) = @_;
+
+				# connect failed?
+				unless (defined $fh) {
+
+					# invoke error callback
+					if (ref($args->{on_error}) eq 'CODE') {
+						$args->{on_error}->($self, $id, "$!");
+					}
+
+					# destroy handle
+					$self->drop($id);
+					return;
+				}
+
+				# connect succeeded, time to create handle
+				$self->{_cs}->{$id}->{h} = AnyEvent::Handle->new(
+					fh => $fh,
+					no_delay => 1,
+					on_connect => sub {
+						$on_connect->($self, $id) if ($on_connect)
+					}
+				);
+
+				# register callbacks
+				for my $name (qw/error hup read/) {
+					my $cb    = $args->{"on_$name"};
+					my $event = "on_$name";
+					$self->$event($id => $cb) if $cb;
+				}
+
+				# TLS?
+				if ($args->{tls}) { $self->start_tls($id => $args) }
+			},
+
+			# prepare callback
+			sub {
+
+				# my ($sock) = @_;
+				# return connect timeout
+				return $self->connect_timeout();
+			}
+		);
 	}
 
 	return $id;
@@ -249,42 +261,57 @@ sub connect {
 
 sub connection_timeout {
 	my ($self, $id, $timeout) = @_;
+	return unless (defined $id && exists($self->{_cs}->{$id}));
+	my $h = $self->{_cs}->{$id}->{h};
+	return unless ($h);
 
-	# Connection
-	return unless my $c = $self->{_id}->{$id};
-
-	return $c->timeout() unless ($timeout);
-	
-	if ($c->isa('Guard')) {
-		
-	} else {
-		$c->timeout($timeout);
+	if ($timeout) {
+		$h->timeout($timeout);
+		return $self;
 	}
-	return $self;
+
+	return $h->timeout();
 }
 
 sub drop {
 	my ($self, $id) = @_;
-	my $h = (exists($self->{_id}->{$id})) ? $self->{_id}->{$id} : undef;
-	return undef unless (defined $h);
+	my $c = $self->{_cs}->{$id};
+	return 0 unless (defined $id);
 
-	# Real handle?
-	if ($h->isa('AnyEvent::Handle')) {
-		$h->destroy();
+	# drop handle
+	if (ref($c) eq 'HASH') {
+		if (defined $c->{h}) {
+			$c->{h}->destroy();
+			$c->{h} = undef;
+		}
+
+		# drop guard
+		if (defined $c->{g}) {
+			$c->{g} = undef;
+		}
 	}
 
-	# delete handler
-	undef $self->{_id}->{$id};
-	delete($self->{_id}->{$id});
+	# drop it...
+	delete($self->{_cs}->{$id});
 
-	return $self;
+=pod
+  # Drop connection gracefully
+  if (my $c = $self->{_cs}->{$id}) { return $c->{finish} = 1 }
+
+  # Drop
+  return $self->_drop_immediately($id);
+=cut
+
 }
+
+sub _drop_immediately { drop(@_) }
 
 sub generate_port {
 	my $self = shift;
 
 	# Ports
 	my $port = 1 . int(rand 10) . int(rand 10) . int(rand 10) . int(rand 10);
+	eval { require IO::Socket::INET };
 	while ($port++ < 30000) {
 
 		# Try port
@@ -301,13 +328,10 @@ sub generate_port {
 	return;
 }
 
-sub is_running {
-	my $self = shift;
-	return (defined $self->{_cv}) ? 1 : 0;
-}
+sub is_running { shift->{_running} }
 
-# Fat Tony is a cancer on this fair city!
-# He is the cancer and I am theâ€¦ uhâ€¦ what cures cancer?
+# "Fat Tony is a cancer on this fair city!
+#  He is the cancer and I am the… uh… what cures cancer?"
 sub listen {
 	my $self = shift;
 
@@ -315,228 +339,259 @@ sub listen {
 	my $args = ref $_[0] ? $_[0] : {@_};
 
 	# TLS check
-	croak "Net::SSLeay required for TLS support"
+	croak "AnyEvent::TLS required for TLS support"
 	  if $args->{tls} && !TLS;
 
-	# TODO: fix id generation stuff...
-	my $id = _newId();
 
-	#my $id = refaddr($listener);
-
-	# remove ipv6 brackets from address
-	if (defined $args->{address}) {
-		$args->{address} =~ s/[\[\]]+//g;
-	}
-
-	# create guard object...
-	local $@;
-	my $guard = eval {
-		tcp_server(
-			$args->{address},    # listening address
-			$args->{port},       # listening port
-
-			# accept callback
-			sub { $self->_accept($args, $id, @_) },
-
-			# prepare callback
-			sub { $self->_listen_prepare($id, @_) },
-		);
+	my $listen = {
+		g => undef,
+		h => undef,
 	};
-	if ($@) {
-		croak "Error creating listening socket: $@";
-		return undef;
+	my $id = refaddr($listen);
+	$self->{_cs}->{$id} = $listen;
+
+	my $addr = undef;
+	my $port = undef;
+	if ($args->{file}) {
+		$addr = 'unix/';
+		$port = $args->{file};
+	}
+	elsif ($args->{address}) {
+		$addr = delete($args->{address});
+		$addr = s/[\[\]]+//g;
+		$port = delete($args->{port}) || 3000;
+	}
+	else {
+		$addr = undef;
+		$port = delete($args->{port}) || 3000;
 	}
 
-	# save listener...
-	$self->{_id}->{$id} = $guard;
+	my $on_accept = delete($args->{on_accept});
+	unless (ref($on_accept) eq 'CODE') {
+		croak "No on_accept defined!";
+		return;
+	}
 
-	#print "Created guard: ", Dumper($guard), "\n";
+	# create tcp server
+	$listen->{g} = tcp_server(
+		$addr,
+		$port,
 
-=pod
-	# TLS options
-	$c->{tls} = {
-		SSL_startHandshake => 0,
-		SSL_cert_file      => $args->{tls_cert} || $self->_prepare_cert,
-		SSL_key_file       => $args->{tls_key} || $self->_prepare_key
-	  }
-	  if $args->{tls};
+		# accept cb
+		sub {
 
-	# Accept limit
-	$self->{_accepts} = $self->max_accepts if $self->max_accepts;
-=cut
+			# TODO: handle max_accepts!
+			my ($fh, $host, $port) = @_;
+			print "accept: $fh, $host, $port\n" if DEBUG;
+
+			# time to create client handle!
+			my $ch = AnyEvent::Handle->new(fh => $fh, no_delay => 1);
+			my $cid = refaddr($ch);
+			
+			# set connection timeout
+			$ch->on_rtimeout(sub { $args->{on_hup}->($self, $cid) }) if ($args->{on_hup});
+			$ch->rtimeout($self->connection_timeout());
+
+			# save handle
+			$self->{_cs}->{$cid} = {h => $ch};
+
+			# apply callbacks
+			for my $name (qw/error hup read/) {
+				my $cb    = $args->{"on_$name"};
+				my $event = "on_$name";
+				$self->$event($cid => $cb) if $cb;
+			}
+
+			# TLS?
+			if ($args->{tls}) {
+				my $ca = $args->{tls_ca};
+				my $ca_is_file = (defined $ca && -T $ca) ? 1 : 0;
+				$ch->starttls(
+					'accept',
+					{   sslv2     => 0,
+						sslv3     => 1,
+						tlsv1     => 1,
+						cert_file => $args->{tls_cert}
+						  || $self->_prepare_cert(),
+						key_file => $args->{tls_key} || $self->_prepare_key(),
+						verify             => ($ca)         ? 1     : 0,
+						verify_client_cert => ($ca)         ? 1     : 0,
+						verify_peername    => 'http',
+						ca_file            => ($ca_is_file) ? $ca   : undef,
+						ca_path            => ($ca_is_file) ? undef : $ca,
+						check_crl => (defined $args->{tls_crl} && -T $args->{tls_crl})
+						? $args->{tls_crl}
+						: undef,
+					},
+				);
+
+			}
+
+			# fire on_accept handler!
+			$on_accept->($self, $cid);
+		},
+
+		# prepare cb
+		sub {
+
+			#my ($fh, $host, $port) = @_;
+			#tcp_nodelay $fh, 1;
+			# setsockopt($fh, IPPROTO_TCP, SO_REUSEADDR, 1);
+		}
+	);
 
 	return $id;
 }
 
 sub local_info {
 	my ($self, $id) = @_;
-
-	# Connection
-	return {} unless my $c = $self->{_id}->{$id};
-	
-	my $socket = undef;
-	if ($c->isa('Guard')) {
-	}
-	elsif ($c->isa('AnyEvent::Handle')) {
-		$socket = $c->fh();
-	} else {
-		
-	}
-
-	# Socket
-	return {} unless (defined $socket);
+	return {} unless (defined $id && exists($self->{_cs}->{$id}));
+	my $h = $self->{_cs}->{$id}->{h};
+	my $socket =
+	  (defined $h && blessed($h) && $h->isa('AnyEvent::Handle'))
+	  ? $h->fh()
+	  : undef;
+	return {} unless ($socket);
 
 	# UNIX domain socket info
 	return {path => $socket->hostpath} if $socket->can('hostpath');
 
 	# Info
-	#return {address => $socket->sockhost, port => $socket->sockport};
+	# return {address => $socket->sockhost, port => $socket->sockport};
+	# TODO: fix this
 	return {address => "skfdhsh", port => "kjdhkfdhd"};
 }
 
 sub lookup {
 	my ($self, $name, $cb) = @_;
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
 
-	# create resolver...
-	my $res = AnyEvent::DNS->resolver();
+	# create resolver
+	my $res = AnyEvent::DNS::resolver();
+	$res->timeout([$self->dns_timeout()]);
 
+	weaken $self;
+
+	# fire dns request!
 	$res->resolve(
 		$name, '*',
 		accept => ["a", "aaaa"],
 		sub {
-			my @addrs = ();
-			if (defined $_[0] && ref($_[0]) eq 'ARRAY') {
-				map { push(@addrs, $_->[3]) } @{$_[0]};
-			}
+			my $res = [];
+			map { push(@{$res}, $_->[3]) } @_;
 
-			# invoke callback...
-			$cb->($self, shift(@addrs));
+			# fire cb
+			$cb->($self, $res);
 		},
 	);
-}
 
-sub resolve {
-	my ($self, $name, $type, $cb) = @_;
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
-
-	# create resolver...
-	my $res = AnyEvent::DNS->resolver();
-
-	$res->resolve(
-		$name, '*',
-		accept => [lc($type)],
-		sub {
-			my @addrs = ();
-			if (defined $_[0] && ref($_[0]) eq 'ARRAY') {
-				map { push(@addrs, $_->[3]) } @{$_[0]};
-			}
-
-			# invoke callback...
-			$cb->($self, shift(@addrs));
-		},
-	);
+	return $self;
 }
 
 sub on_error {
 	my ($self, $id, $cb) = @_;
-	print STDERR "on_error(): id=$id, cb=$cb\n" if (DEBUG);
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
-	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
-	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+	return unless (exists $self->{_cs}->{$id});
+	my $h = $self->{_cs}->{$id}->{h};
+	return unless (defined $h);
 
 	weaken $self;
 
-	# set ...
-	$h->on_error(sub {
-		# fire callback
-		$cb->($self, $id, $_[2]);
-		# drop the handle
-		$self->drop($id);
-	});
+	# set callback
+	$h->on_error(
+		sub {
+			my ($hdl, $fatal, $msg) = @_;
+			print "error on $id: $msg\n" if DEBUG;
+			$cb->($self, $id, $msg);
+			$self->drop($id);
+		}
+	);
 
 	return $self;
 }
 
 sub on_hup {
 	my ($self, $id, $cb) = @_;
-	print STDERR "on_hup(): id=$id, cb=$cb\n" if (DEBUG);
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
-	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
-	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+	return unless (exists $self->{_cs}->{$id});
+	my $h = $self->{_cs}->{$id}->{h};
+	return unless (defined $h);
 
 	weaken $self;
-	
+
+	# set callback
 	$h->on_eof(
 		sub {
+			my ($hdl) = @_;
+			print "hup on $id\n" if DEBUG;
 			$cb->($self, $id);
 			$self->drop($id);
 		}
 	);
 
+	return $self;
 }
+
 sub on_idle {
-	print "on_idle: @_\n";
+	my ($self, $cb) = @_;
+	print "idle\n" if (DEBUG);
+	my $idle = AE::idle $cb;
+	my $id   = refaddr($idle);
+	$self->{_cs}->{$id} = $idle;
+	return $self;
 }
 
 sub on_read {
 	my ($self, $id, $cb) = @_;
-	print STDERR "on_read(): id=$id, cb=$cb\n" if (DEBUG);
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
-	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
-	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
+	return unless (exists $self->{_cs}->{$id});
+	my $h = $self->{_cs}->{$id}->{h};
+	return unless (defined $h);
 
 	weaken $self;
 
+	# set callback
 	$h->on_read(
 		sub {
+			print "read on $id\n" if DEBUG;
 			my ($h) = @_;
-			my $buf = $h->{rbuf};
+			$cb->($self, $id, $h->{rbuf});
 			$h->{rbuf} = '';
-			$cb->($self, $id, $buf);
 		}
 	);
-	print STDERR "  on_read(): callback set.\n" if (DEBUG);
+
+	return $self;
 }
-
-sub on_timeout {
-	my ($self, $id, $cb) = @_;
-	print STDERR "on_timeout(): id=$id, cb=$cb\n" if (DEBUG);
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
-	my $h = ($self->{_id}->{$id}) ? $self->{_id}->{$id} : undef;
-	return undef unless (defined $h && $h->isa('AnyEvent::Handle'));
-
-	weaken $self;
-
-	$h->on_timeout(
-		sub { $cb->($self, $id) }
-	);
-	print STDERR "  on_timeout(): callback set.\n" if (DEBUG);
-}
-
 
 sub on_tick {
-	print "on_tick: @_\n";
+	my ($self, $cb) = @_;
+	if ($cb && $self->timeout) {
+		my $c = {
+			g => undef,
+			t => AE::timer(0.01, $self->timeout(), $cb)
+		};
+		my $id = refaddr($c);
+		$self->{_cs}->{$id} = $c;
+	}
+	#croak 'on_tick is not supported in ' . ref($self);
+	return $self;
 }
 
 sub one_tick {
 	my ($self, $timeout) = @_;
+	croak 'one_tick is not supported in ' . ref($self);
+}
+
+sub handle {
+	my ($self, $id) = @_;
+	return unless my $c = $self->{_cs}->{$id};
+	return unless (ref($c) eq 'HASH' && $c->{h});
+	return $c->{h}->fh();
 }
 
 sub remote_info {
 	my ($self, $id) = @_;
+	return {} unless my $c = $self->{_cs}->{$id};
+	return {} unless (ref($c) eq 'HASH' && $c->{h});
 
-	# Connection
-	return {} unless my $c = $self->{_id}->{$id};
-
-	my $socket = undef;
-	if ($c->isa('Guard')) {
-	}
-	elsif ($c->isa('AnyEvent::Handle')) {
-		$socket = $c->fh();
-	} else {
-		
-	}
+	my $socket =
+	  (blessed($c) && $c->isa('AnyEvent::Handle')) ? $c->fh() : undef;
 
 	# Socket
 	return {} unless (defined $socket);
@@ -545,35 +600,66 @@ sub remote_info {
 	return {path => $socket->peerpath} if $socket->can('peerpath');
 
 	# Info
-	return {address => $socket->peerhost, port => $socket->peerport} if ($socket->can('peerhost'));
+	return {address => $socket->peerhost, port => $socket->peerport}
+	  if ($socket->can('peerhost'));
 }
 
-sub singleton {
-	unless (defined $_loop) {
-		$_loop = __PACKAGE__->new();
-	}
-	return $_loop;
+sub resolve {
+	my ($self, $name, $type, $cb) = @_;
+
+	# create resolver
+	my $res = AnyEvent::DNS::resolver();
+	$res->timeout([$self->dns_timeout()]);
+
+	# fire dns request!
+	$res->resolve(
+		$name, $type,
+		sub {
+			#use Data::Dumper;
+			#print STDERR "RESOLVE CB_ ", Dumper(\ @_), "\n";
+			my $res = [];
+			map { push(@{$res}, [ $_->[1], $_->[3] ]) } $_[0];
+
+			# fire cb
+			$cb->($self, $res);
+		},
+	);
+
+	return $self;
 }
+
+sub singleton { $LOOP ||= shift->new(@_) }
 
 sub start {
 	my $self = shift;
+	return if ($self->{_running});
 
-	# create condvar...
+# create condvar...
+# TODO: beware of this monster!
+# http://search.cpan.org/~mlehmann/AnyEvent-5.31/lib/AnyEvent/FAQ.pod#Why_do_some_backends_use_a_lot_of_CPU_in_AE::cv->recv?
 	$self->{_cv} = AnyEvent->condvar();
+
+	# we're now running
+	$self->{_running} = 1;
 
 	# wait for completion...
 	$self->{_cv}->recv();
 	delete($self->{_cv});
 
+	print "LOOP $self started!\n" if DEBUG;
 	return $self;
 }
 
 sub start_tls {
 	my $self = shift;
 	my $id   = shift;
+	return unless (exists $self->{_cs}->{$id});
 
-	# Shortcut
-	$self->drop($id) and return unless TLS;
+	# No TLS support
+	unless (TLS) {
+		$self->_error($id, 'AnyEvent::TLS required for TLS support.');
+		return;
+	}
 
 	# Arguments
 	my $args = ref $_[0] ? $_[0] : {@_};
@@ -581,72 +667,90 @@ sub start_tls {
 	# Weaken
 	weaken $self;
 
+	# get handle
+	my $h = $self->{_cs}->{$id}->{h};
+	return unless (defined $h);
+	
+	my $opt = {
+		sslv2 => 0,
+		sslv3 => 1,
+		tlsv1 => 1,
+	};
+	# key/cert
+	$opt->{key_file} = $args->{tls_key} if ($args->{tls_key});
+	$opt->{cert_file} = $args->{tls_key} if ($args->{tls_cert});
+
+	# start tls...
+	$h->starttls('connect', $opt);
+
 	return $id;
 }
 
 sub stop {
-	my $self = shift;
-	return $self unless (defined $self->{_cv});
+	my ($self) = @_;
+	return unless ($self->{_running});
+	return unless (defined $self->{_cv});
 
 	$self->{_cv}->send();
-	return $self;
+	delete($self->{_cv});
+	$self->{_running} = 0;
 }
 
 sub test {
 	my ($self, $id) = @_;
-
-	# Connection
-	return unless my $c = $self->{_id}->{$id};
-
-	# Socket
-	return unless my $socket = $c->{handle};
-
-	my $result = 1;
-
-=pod
-	# Test
-	my $test = $self->{_test} ||= IO::Poll->new;
-	$test->mask($socket, POLLIN);
-	$test->poll(0);
-	my $result = $test->handles(POLLIN | POLLERR | POLLHUP);
-	$test->remove($socket);
-=cut
-
-	return !$result;
+	croak 'Method test is not implemented in ' . ref($self);
 }
-
-# compatibility method for Mojo::Server::Daemon
-sub _drop_immediately { drop(@_) }
 
 sub timer {
 	my ($self, $after, $cb) = @_;
-	return undef unless (defined $cb && ref($cb) eq 'CODE');
+	weaken $self;
+	my $t = AE::timer($after, 0, sub { print STDERR "exec timer.\n"; $cb->($self) });
+	my $id = refaddr($t);
 
-	# create AnyEvent timer
-	my $timer = AE::timer($after, 0, $cb);
-	my $id = refaddr($timer);
-
-	# save timer
-	$self->{_id}->{$id} = $timer;
-
-	# return id
+	# save it...
+	$self->{_cs}->{$id} = $t;
 	return $id;
 }
 
 sub write {
 	my ($self, $id, $chunk, $cb) = @_;
-	my $h = $self->{_id}->{$id};
+	return unless (exists $self->{_cs}->{$id});
+	my $h = $self->{_cs}->{$id}->{h};
 	return unless (defined $h);
-	$h->push_write($chunk);
 
 	# write done callback...
 	if ($cb) {
 		$h->on_drain(sub { $cb->($self, $id) });
 	}
 
+	# add chunk for writing...
+	$h->push_write($chunk);
+
+
 	return $self;
 }
 
+sub _error {
+	my ($self, $id, $error) = @_;
+
+	# Connection
+	return unless my $c = $self->{_cs}->{$id};
+
+	# Get error callback
+	my $event = $c->{error};
+
+	# Cleanup
+	$self->_drop_immediately($id);
+
+	# Error
+	$error ||= 'Unknown error, probably harmless.';
+
+	# No event
+	warn "Unhandled event error: $error" and return unless $event;
+
+	# Error callback
+	$self->_run_event('error', $event, $id, $error);
+}
 
 sub _prepare_cert {
 	my $self = shift;
@@ -684,91 +788,42 @@ sub _prepare_key {
 	return $self->{_key} = $key;
 }
 
-sub patch {
-	return 1 if ($_is_patched);
+# Failed callbacks should not kill everything
+sub _run_callback {
+	my $self  = shift;
+	my $event = shift;
+	my $cb    = shift;
 
-	if (exists($INC{'Mojo/IOLoop.pm'})) {
-		print "IOLoop is already loaded, will replace it's methods.\n";
-		$INC{'Mojo/IOLoopOrig.pm'} = $INC{'Mojo/IOLoop.pm'};
-	}
-	else {
-		print "IOLoop is NOT loaded, will create it...\n";
-		$INC{'Mojo/IOLoop.pm'} = __FILE__;
-	}
+	# Invoke callback
+	my $value = eval { $self->$cb(@_) };
 
+	# Callback error
+	warn qq/Callback "$event" failed: $@/ if $@;
 
-	use Data::Dumper;
-
-	#$Data::Dumper::Indent = 0;
-	#$Data::Dumper::Terse = 1;
-
-	print "PKG: ", Dumper(\%{AnyEvent::Mojolicious::IOLoop::}), "\n";
-
-	# copy subs...
-	for (keys %{AnyEvent::Mojolicious::IOLoop::}) {
-
-		no strict 'refs';
-		no warnings 'redefine';
-		print "key: $_\n";
-
-		my $sub = undef;
-		eval { $sub = *{$AnyEvent::Mojolicious::IOLoop::{$_}{CODE}} };
-		next if ($@);
-
-		print "SUB: $sub :: ", Dumper($sub), "\n";
-
-		next;
-	}
-
-	$_is_patched = 1;
-	return 1;
+	return $value;
 }
 
-sub _newId {
-	return sprintf("%-.7d", int(time()) + int(rand(10000000)));
-}
+sub _tls_accept {
+	my ($self, $id) = @_;
 
-sub _accept {
-	my ($self, $args, $id, $fh, $host, $port) = @_;
-	print STDERR "_accept(): id=$id, fh=$fh, host=$host, port=$port\n" if (DEBUG);
+	# Connection
+	my $c = $self->{_cs}->{$id};
 
-	weaken $self;
+	# Accepted
+	if ($c->{handle}->accept_SSL) {
 
-	# tls stuff?
+		# Cleanup
+		delete $c->{tls_accept};
 
-	#print STDERR "accept cb: ", join(", ",  @_), "\n";
-	# create handle object
-	my $c = AnyEvent::Handle->new(
-		fh         => $fh,
-		# timeout    => 10000,
-	);
-	my $cid = refaddr($c);
-	
-	# save connection
-	$self->{_id}->{$cid} = $c;
-	
-	# apply callbacks...
-	foreach my $k (keys %{$args}) {
-		next unless ($k =~ m/^on_/);
-		#print "  _accept(): setting $k\n" if (DEBUG);
-		if ($self->can($k)) {
-			$self->$k($cid, $args->{$k});
-		}
+		# Accept callback
+		my $cb = $c->{on_accept};
+		$self->_run_event('accept', $cb, $id) if $cb;
+
+		return;
 	}
 
-	# on accept_cb?
-	if ($args->{on_accept}) {
-		$args->{on_accept}->($self, $cid);
-	}
-
-	print STDERR "_accept(): Accepted new connection id: $cid\n" if (DEBUG);
-}
-
-sub _listen_prepare {
-	my ($self, $id, $fh, $host, $port) = @_;
-	print STDERR "_accept_prepare(): id=$id, fh=$fh, host=$host, port=$port\n" if (DEBUG);
+	# Handle error
+	$self->_tls_error($id);
 }
 
 1;
-
-# EOF
