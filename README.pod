@@ -4,7 +4,7 @@ This is a port of L<Mojo::IOLoop> to L<AnyEvent> event framework;
 
 =head1 AnyEvent?
 
-L<AnyEvent> is coolest event loop available for perl. You want to
+L<AnyEvent> is B<the c00lest> event loop available for L<Perl>. You want to
 use it in your Mojo apps :)
 
 =head1 Why should i care?
