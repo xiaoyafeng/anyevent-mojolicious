@@ -125,12 +125,17 @@ our $LOOP;
 
 sub DESTROY {
   my $self = shift;
+  
+  # drop on_idle
+  for my $id (keys %{$self->{_idle}}) { $self->_drop_immediately($id) };
+  $self->{_idle_ae} = undef;
+  
+  # drop on_tick
+  for my $id (keys %{$self->{_tick}}) { $self->_drop_immediately($id) };
+  $self->{_tick_ae} = undef;
 
-  # Cleanup connections
+  # remove connections and timers
   for my $id (keys %{$self->{_cs}}) { $self->_drop_immediately($id) }
-
-  # Cleanup listen sockets
-  for my $id (keys %{$self->{_listen}}) { $self->_drop_immediately($id) }
 
   # Cleanup temporary cert file
   if (my $cert = $self->{_cert}) { unlink $cert if -w $cert }
@@ -150,6 +155,9 @@ sub new {
   # watchers: listeners, connections, alarms,
   # 
   $self->{_cs} = {};
+  
+  # number of dns lookups in progress...
+  $self->{_dns_loopups} = 0;
 
   # on_idle callback subs
   $self->{_idle} = {};
@@ -324,10 +332,11 @@ sub drop {
   }
   
   my $c = $self->{_cs}->{$id};
-  return 0 unless (defined $id);
+  return unless (defined $id);
   
   # we want to gracefully drop a connection
-  if (ref($c) eq 'HASH' && defined $c->{h}) {	
+  if (ref($c) eq 'HASH' && defined $c->{h}) {
+  	print STDERR ref($self), " drop(): Will gracefully drop id $id\n" if DEBUG;
   	weaken $self;
   	$c->{h}->on_drain(sub { $self->_drop_immediately($id) });
   	return;
@@ -339,9 +348,9 @@ sub drop {
 
 sub _drop_immediately {
   my ($self, $id) = @_;
-
   my $c = $self->{_cs}->{$id};
   return 0 unless (defined $id);
+  print STDERR ref($self), " _drop_immediately(): Dropping id $id\n" if DEBUG;
 
   # drop handle
   if (ref($c) eq 'HASH') {
@@ -422,7 +431,7 @@ sub listen {
   
   if (DEBUG) {
   	no warnings;
-    print STDERR ref($self), " listen(): will listen on addr = '$addr', port = '$port'\n";
+    print STDERR ref($self), " listen(): id $id will listen on addr = '$addr', port = '$port'\n";
   }
 
   my $on_accept = delete($args->{on_accept}) || undef;
@@ -441,7 +450,7 @@ sub listen {
 
       # TODO: handle max_accepts!
       my ($fh, $host, $port) = @_;
-      print STDERR ref($self), " accept: $fh, $host, $port\n" if DEBUG;
+      print STDERR ref($self), " listen() accepted on $id: $fh, $host, $port\n" if DEBUG;
 
       # time to create client handle!
       my $ch = AnyEvent::Handle->new(fh => $fh, no_delay => 1);
@@ -455,13 +464,15 @@ sub listen {
       # save handle
       $self->{_cs}->{$cid} = {h => $ch, address => $host, port => $port};
 
+      print STDERR ref($self), " listen(): Created new connection id $cid\n" if DEBUG;
+
       # apply callbacks
       for my $name (qw/error hup read/) {
         my $cb    = $args->{"on_$name"};
         my $event = "on_$name";
         $self->$event($cid => $cb) if $cb;
       }
-
+      
       # TLS?
       if ($args->{tls}) {
         my $ca = $args->{tls_ca};
@@ -487,7 +498,10 @@ sub listen {
       }
 
       # fire on_accept handler!
-      $on_accept->($self, $cid) if ($on_accept);
+      if ($on_accept) {
+      	print STDERR ref($self), " listen(): firing on_accept callback for id $cid\n" if DEBUG;
+      	$on_accept->($self, $cid);
+      }
     },
 
     # prepare cb
@@ -495,9 +509,6 @@ sub listen {
       my ($fh, $host, $port) = @_;
       $self->{_cs}->{$id}->{address} = $host;
       $self->{_cs}->{$id}->{port} = $port;
-      
-      #tcp_nodelay $fh, 1;
-      # setsockopt($fh, IPPROTO_TCP, SO_REUSEADDR, 1);
     }
   );
 
@@ -506,27 +517,18 @@ sub listen {
 
 sub lookup {
   my ($self, $name, $cb) = @_;
-
-  # create resolver
-  my $res = AnyEvent::DNS::resolver();
-  $res->timeout([$self->dns_timeout()]);
-
+  print STDERR ref($self), " lookup(): name '$name', cb: '$cb'\n" if DEBUG;
+  
+  # run real resolving method
   weaken $self;
-
-  # fire dns request!
-  $res->resolve(
-    $name, '*',
-    accept => ["a", "aaaa"],
-    sub {
-      my $res = [];
-      map { push(@{$res}, $_->[3]) } @_;
-
-      # fire cb
-      $cb->($self, $res);
-    },
+  $self->resolve(
+  	$name,
+  	'a_or_aaaa',
+  	sub {
+  		my @res = map { $_->[1] } @{$_[1]};
+  		$cb->($self, @res)
+  	},
   );
-
-  return $self;
 }
 
 sub on_error {
@@ -534,12 +536,17 @@ sub on_error {
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
+  print STDERR ref($self), " on_error(): setting cb for $id\n" if DEBUG;
+  
 
   weaken $self;
 
   my $rcb = sub {
       my ($hdl, $fatal, $msg) = @_;
-      print STDERR ref($self), " on_error() on $id: $msg\n" if DEBUG;
+      if (DEBUG) {
+      	no warnings;
+      	print STDERR ref($self), " on_error(): $id [fatal: $fatal]: $msg\n" if DEBUG;
+      }
       $self->_drop_immediately($id);
       $cb->($self, $id, $msg); 
   };
@@ -560,6 +567,7 @@ sub on_hup {
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
 
+  print STDERR ref($self), " on_hup(): setting cb for $id\n" if DEBUG;
   weaken $self;
   
   # create own sub wrapper
@@ -634,13 +642,15 @@ sub on_read {
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
+  
+  print STDERR ref($self), " on_read(): Setting callback for id $id\n" if DEBUG;
 
   weaken $self;
 
   # set callback
   $h->on_read(
     sub {
-      print STDERR ref($self), " read on $id\n" if DEBUG;
+      print STDERR ref($self), " on_read(): read data on id $id\n" if DEBUG;
       my ($h) = @_;
       $cb->($self, $id, $h->{rbuf});
       $h->{rbuf} = '';
@@ -714,20 +724,62 @@ sub remote_info {
 
 sub resolve {
   my ($self, $name, $type, $cb) = @_;
+  croak "No query name specified." unless (defined $name && length $name);
+  $type = '*' unless (defined $type && length $type);
+  $type = lc($type);
+  print STDERR ref($self), " resolve(): name: '$name', type: '$type'\n" if DEBUG;
 
   # create resolver
   my $res = AnyEvent::DNS::resolver();
   $res->timeout([$self->dns_timeout()]);
-
-  # fire dns request!
+  
+  # increase number of dns lookups
+  $self->{_dns_lookups}++;
+  
+  # query options
+  my %opt = ();
+  if ($name eq 'a_or_aaaa') {
+  	$opt{accept} = [ 'a', 'aaaa' ];
+  }
+  elsif ($name eq 'cname') {
+  	$opt{accept} = [ 'cname' ];
+  }
+  
+  weaken $self;
+  
+  # seems like PTR doesn't work
+  # well with resolver->resolve($ip, 'ptr');
+  if ($type eq 'ptr') {
+  	AnyEvent::DNS::reverse_lookup $name, sub {
+  	  print "PTR: ", join(", ", @_), "\n";
+  	  my $res = [];
+  	  map { push(@{$res}, [ 'PTR', $_, '3600' ]) } @_;
+  	  $cb->($self, $res);
+  	};
+  	return $self;
+  }
+  
+  # fire "normal" dns request!
   $res->resolve(
     $name, $type,
+    %opt,
     sub {
+    	
+      # decrease number of running dns requests...
+      $self->{_dns_lookups}-- if ($self->{_dns_lookups});
 
-      #use Data::Dumper;
-      #print STDERR ref($self), " RESOLVE CB_ ", Dumper(\ @_), "\n";
       my $res = [];
-      map { push(@{$res}, [$_->[1], $_->[3]]) } $_[0];
+      foreach (@_) {
+      	my $t = $_->[1];
+      	my $val_pos = ($type eq 'mx') ? 4 : 3;
+      	# dns record TTL value
+      	# Currently there is no option
+      	# to get TTL data by using AnyEvent::DNS
+      	my $ttl = 3600;
+      	my $v = $_->[$val_pos];
+      	# mojo tests want uppercase record types...
+      	push(@{$res}, [ uc($t), $v, $ttl ]) if (defined $t && defined $v);
+      }
 
       # fire cb
       $cb->($self, $res);
@@ -742,15 +794,14 @@ sub singleton { $LOOP ||= shift->new(@_) }
 sub start {
   my $self = shift;
   return unless (defined $self);
-  return if ($self->{_running});
-  return if ($self->{_cv});
+  return if ($self->{_running} || $self->{_cv});
   
-  unless (%{$self->{_cs}}) {
-  	print STDERR ref($self), " start(): No handles to watch, returning immediately.\n";
+  unless (%{$self->{_cs}} || $self->{_dns_lookups}) {
+  	print STDERR ref($self), " start(): No handles to watch, returning immediately.\n" if DEBUG;
   	return;
   }
   
-  print STDERR ref($self), " start(): Creating condvar\n";
+  print STDERR ref($self), " start(): Creating condvar\n" if DEBUG;
 
 # create condvar...
 # TODO: beware of this monster!
@@ -762,9 +813,9 @@ sub start {
 
   # wait for completion...
   $self->{_cv}->recv();
-  delete($self->{_cv});
+  undef $self->{_cv};
 
-  print STDERR ref($self), " LOOP $self started!\n" if DEBUG;
+  print STDERR ref($self), " start(): Loop $self stopped!\n" if DEBUG;
   return $self;
 }
 
@@ -788,6 +839,7 @@ sub start_tls {
   # get handle
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
+  print STDERR ref($self), " starttls(): starting TLS on id $id\n" if DEBUG;
 
   # create TLS ctx
   local $@;
@@ -817,11 +869,11 @@ sub start_tls {
 
 sub stop {
   my ($self) = @_;
-  return unless ($self->{_running});
-  return unless (defined $self->{_cv});
+  return unless ($self->{_running} || defined $self->{_cv});
 
-  $self->{_cv}->send();
-  #delete($self->{_cv});
+  print STDERR ref($self), " stop(): stopping loop $self\n" if DEBUG;
+  $self->{_cv}->send() if (defined $self->{_cv});
+  #$self->{_cv} = undef;
   $self->{_running} = 0;
 }
 
@@ -846,6 +898,9 @@ sub write {
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
+  
+  print STDERR ref($self), " write(): Writing data to id $id.\n" if DEBUG;
+  
 
   # add chunk for writing...
   $h->push_write($chunk);
