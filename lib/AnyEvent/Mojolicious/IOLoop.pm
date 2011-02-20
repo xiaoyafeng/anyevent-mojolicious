@@ -368,6 +368,7 @@ sub generate_port {
   while ($port++ < 30000) {
 
     # Try port
+    eval { require IO::Socket::INET };
     return $port
       if IO::Socket::INET->new(
       Listen    => 5,
