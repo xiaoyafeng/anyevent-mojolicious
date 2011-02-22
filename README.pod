@@ -22,6 +22,11 @@ your app, think again. L<Mojolicious> has it all. Just
 and you can now use great HTTP L<client|Mojo::Client> and L<server|Mojo::Server::Daemon>
 implementation fully supporting B<IPv6>, B<HTTP/1.1> and B<TLS>.
 
+=head1 CURRENT LIMITATIONS:
+
+ * Mojo::Client doesn't work (at all!)
+ * TLS works poorly (only server implementation currently works)
+
 =head1 SYNOPSIS
 
 Put the following in B<myapp.pl>:
