@@ -174,120 +174,110 @@ sub new {
 
 sub connect {
   my $self = shift;
-
-  # Arguments
   my $args = ref $_[0] ? $_[0] : {@_};
-
-  # Protocol
   $args->{proto} ||= 'tcp';
+
+  use Data::Dumper;
+  
 
   if (lc($args->{proto}) ne 'tcp') {
     croak "Unsupported protocol: $args->{proto}";
   }
 
-  # connection structure
-  my $conn = {
-    g => undef,    # guard object
-    h => undef,    # handle object
-  };
+  print STDERR ref($self), " connect(): args: ", Dumper($args), "\n" if DEBUG;
 
-  # compute id and save it
+  my $conn = { g => undef, h => undef};
   my $id = refaddr($conn);
+  print STDERR ref($self), " connect(): new connection id: $id\n" if DEBUG;
   $self->{_cs}->{$id} = $conn;
+  
+  weaken $self;
 
-  my $on_connect = delete($args->{on_connect});
-  $on_connect = undef unless (ref($on_connect) eq 'CODE');
-
-  # do we have handle?
+  # get handle
   my $handle = delete($args->{handle}) || delete($args->{socket}) || undef;
-
-  # socket/handle?
+  $handle = undef unless (defined $handle && fileno($handle) >= 0);
+  print STDERR ref($self), " connect(): id $id: handle: $handle\n" if DEBUG && $handle;
+  
+  # do we have handle?
   if (defined $handle) {
-
-    # create anyevent handle right away!
-    $self->{_cs}->{$id}->{h} = AnyEvent::Handle->new(
-      fh       => $handle,
-      no_delay => 1,
-    );
-    $self->{_cs}->{$id}->{h}->on_connect(sub { $on_connect->($self, $id) })
-      if ($on_connect);
-
-    # register callbacks
-    for my $name (qw/error hup read/) {
-      my $cb    = $args->{"on_$name"};
-      my $event = "on_$name";
-      $self->$event($id => $cb) if $cb;
-    }
+  	$self->_handle_connect($id, $handle, $args);
   }
-
-  # nop, someone wants real connection
   else {
-
-    # Remove [] from address (ipv6 stuff)
+  	# Remove [] from address (ipv6 stuff)
     $args->{address} =~ s/[\[\]]+//g;
-
-    # create connection guard...
-    $conn->{g} = tcp_connect(
-      $args->{address},
-      $args->{port},
-
-      # connect callback
-      sub {
-        my ($fh, $host, $port, $retry) = @_;
-
-        # connect failed?
-        unless (defined $fh) {
-
-          # invoke error callback
-          if (ref($args->{on_error}) eq 'CODE') {
-            $args->{on_error}->($self, $id, "$!");
+  	print STDERR ref($self), " connect(): id $id: Creating new connection to [$args->{address}]:$args->{port}.\n" if DEBUG;
+  	$conn->{g} = tcp_connect(
+  		$args->{address},
+  		$args->{port},
+  		# on_connect
+  		sub {
+          my ($fh, $host, $port, $retry) = @_;
+          # connect failed?
+          unless ($fh) {
+          	print STDERR ref($self), " connect(): id $id: connect failed: $!\n" if DEBUG;
+          	return $self->_error($id, $!);
           }
 
-          # destroy handle
-          $self->drop($id);
-          return;
-        }
-
-        # connect succeeded, time to create handle
-        $self->{_cs}->{$id}->{h} = AnyEvent::Handle->new(
-          fh         => $fh,
-          no_delay   => 1,
-          on_connect => sub {
-            $on_connect->($self, $id) if ($on_connect);
-          }
-        );
-        $self->{_cs}->{$id}->{address} = $host;
-        $self->{_cs}->{$id}->{port} = $port;
-
-        # register callbacks
-        for my $name (qw/error hup read/) {
-          my $cb    = $args->{"on_$name"};
-          my $event = "on_$name";
-          $self->$event($id => $cb) if $cb;
-        }
-        
-        # do we have connection timeout set somewhere?
-        if (defined (my $to = $self->{_cs}->{$id}->{timeout})) {
-        	# print STDERR ref($self), " connect(): setting pre-connect-ok set connection_timeout: $id => $to\n" if DEBUG;
-        	$self->connection_timeout($id, $to);
-        }
-
-        # TLS?
-        if ($args->{tls}) { $self->start_tls($id => $args) }
-      },
-
-      # prepare callback
-      sub {
-
-        # my ($sock) = @_;
-        # return connect timeout
-        return $self->connect_timeout();
-      }
-    );
+          print STDERR ref($self), " connect(): id $id: connect ok to $host port $port, fh $fh, retry: $retry\n" if DEBUG;
+          $conn->{host} = $host;
+          $conn->{port} = $port;
+          $self->_handle_connect($id, $fh, $args);
+  		},
+  		# on_prepare
+  		sub {
+  		  my ($fh) = @_;
+          print STDERR ref($self), " connect(): id $id: on_prepare, fh $fh\n" if DEBUG;
+          return $self->connect_timeout();
+  		}
+  	);
   }
   
-  print STDERR ref($self), " connect(): created connection: $id\n" if DEBUG;
   return $id;
+}
+
+sub _handle_connect {
+  my ($self, $id, $fh, $args) = @_;
+  print STDERR ref($self), " _handle_connect(): id $id: fh $fh\n" if DEBUG;
+  
+  # create AnyEvent::Handle
+  my $aeh = AnyEvent::Handle->new(fh => $fh);
+  $self->{_cs}->{$id}->{h} = $aeh;
+  $aeh->timeout($self->connection_timeout());
+
+  # register callbacks
+  for my $name (qw/error hup read/) {
+    my $cb    = $args->{"on_$name"};
+    my $event = "on_$name";
+    $self->$event($id => $cb);
+  }
+
+  weaken $self; 
+  my $on_connect = $args->{on_connect};
+  $on_connect = undef unless (ref($on_connect) eq 'CODE');
+  
+  # TLS?
+  if ($args->{tls}) {
+  	$aeh->on_starttls(
+  	  sub {
+  	  	my ($hdl, $ok, $err) = @_;
+  	  	unless ($ok) {
+  	  		$self->_error($id, $err);
+  	  		return
+  	  	}
+        if ($on_connect) {
+         print STDERR ref($self), " _handle_connect() id $id: on_connect starttls $on_connect\n" if DEBUG;
+         $on_connect->($self, $id);
+        }
+  	  }
+  	);
+  	# start tls
+  	$self->start_tls($id);
+  } else {
+    if ($on_connect) {
+      print STDERR ref($self), " _handle_connect() id $id: on_connect $on_connect\n" if DEBUG;
+      $on_connect->($self, $id);
+    }
+  }
 }
 
 sub connection_timeout {
@@ -321,12 +311,14 @@ sub drop {
   
   # on_idle callback id?
   if (exists $self->{_idle}->{$id}) {
+  	print STDERR ref($self), " drop(): Removing on_idle id $id\n" if DEBUG;
   	delete($self->{_idle}->{$id});
   	return;
   }
   
   # on_tick callback id?
   if (exists $self->{_tick}->{$id}) {
+  	print STDERR ref($self), " drop(): Removing on_tick id $id\n" if DEBUG;
   	delete($self->{_tick}->{$id});
   	return;
   }
@@ -533,15 +525,17 @@ sub lookup {
 
 sub on_error {
   my ($self, $id, $cb) = @_;
+  #print STDERR ref($self), " on_error(): id $id => $cb\n" if DEBUG;
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
-  return unless (defined $h);
-  print STDERR ref($self), " on_error(): setting cb for $id\n" if DEBUG;
   
+  $cb = $self->{_cs}->{$id}->{on_error} unless (defined $cb);
 
-  weaken $self;
+  # do we have handle?
+  if (defined $h) {
+  	weaken $self;
 
-  my $rcb = sub {
+    my $rcb = sub {
       my ($hdl, $fatal, $msg) = @_;
       if (DEBUG) {
       	no warnings;
@@ -549,41 +543,47 @@ sub on_error {
       }
       $self->_drop_immediately($id);
       $cb->($self, $id, $msg); 
-  };
+    };
 
-  # set callback
-  $h->on_error($rcb);
+    # set callback
+    print STDERR ref($self), " on_error(): setting cb for $id\n" if DEBUG;
+    $h->on_error($rcb);
+  } else {
+  	print STDERR ref($self), " on_error(): setting delayed cb for $id\n" if DEBUG;
+  	$self->{_cs}->{$id}->{on_error} = $cb;  	
+  } 
   
-  # save error callback...
-  $self->{_cs}->{$id}->{error_cb} = $rcb; 
-
   return $self;
 }
 
 sub on_hup {
   my ($self, $id, $cb) = @_;
-  return unless (defined $cb && ref($cb) eq 'CODE');
+  # print STDERR ref($self), " on_hup(): id $id => $cb\n" if DEBUG;
+  #return unless (defined $cb && ref($cb) eq 'CODE');
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
-  return unless (defined $h);
-
-  print STDERR ref($self), " on_hup(): setting cb for $id\n" if DEBUG;
-  weaken $self;
   
-  # create own sub wrapper
-  my $rcb = sub {
+  $cb = $self->{_cs}->{$id}->{on_hup} unless (defined $cb);
+  
+  # no handle yet?
+  if (defined $h) {
+  	weaken $self;
+    # create own sub wrapper
+    my $rcb = sub {
       my ($hdl) = @_;
       print STDERR ref($self), " on_hup(): HUP on $id\n" if DEBUG;
       $self->_drop_immediately($id);
       $cb->($self, $id);
-    }
-  ; 
-
-  # set EOF and Timeout callback (the REAL Mojo::IOLoop made me do it!)
-  $h->on_eof($rcb);
-  $h->on_timeout($rcb);
-
-  return $self;
+    };
+    # set EOF and Timeout callback (the REAL Mojo::IOLoop made me do it!)
+    $h->on_eof($rcb);
+    $h->on_timeout($rcb);
+  } else {
+  	print STDERR ref($self), " on_hup(): setting delayed cb for $id\n" if DEBUG;
+  	$self->{_cs}->{$id}->{on_hup} = $cb;
+  }
+ 
+  return $self; 
 }
 
 sub on_idle {
@@ -639,23 +639,30 @@ sub _do_on_tick {
 
 sub on_read {
   my ($self, $id, $cb) = @_;
+  #print STDERR ref($self), " on_read(): id $id => $cb\n" if DEBUG;  
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
-  return unless (defined $h);
   
-  print STDERR ref($self), " on_read(): Setting callback for id $id\n" if DEBUG;
+  $cb = $self->{_cs}->{$id}->{on_read} unless (defined $cb);
+  
+  # do we have handle?
+  if (defined $h) {
+    weaken $self;
 
-  weaken $self;
-
-  # set callback
-  $h->on_read(
-    sub {
-      print STDERR ref($self), " on_read(): read data on id $id\n" if DEBUG;
-      my ($h) = @_;
-      $cb->($self, $id, $h->{rbuf});
-      $h->{rbuf} = '';
-    }
-  );
+    # set callback
+    print STDERR ref($self), " on_read(): Setting callback for id $id\n" if DEBUG;
+    $h->on_read(
+      sub {
+        print STDERR ref($self), " on_read(): read data on id $id\n" if DEBUG;
+        my ($h) = @_;
+        $cb->($self, $id, $h->{rbuf});
+        $h->{rbuf} = '';
+      }
+    );
+  } else {
+  	print STDERR ref($self), " on_read(): setting delayed cb for $id\n" if DEBUG;
+  	$self->{_cs}->{$id}->{on_read} = $cb;  	
+  }
 
   return $self;
 }
@@ -751,7 +758,6 @@ sub resolve {
   # well with resolver->resolve($ip, 'ptr');
   if ($type eq 'ptr') {
   	AnyEvent::DNS::reverse_lookup $name, sub {
-  	  print "PTR: ", join(", ", @_), "\n";
   	  my $res = [];
   	  map { push(@{$res}, [ 'PTR', $_, '3600' ]) } @_;
   	  $cb->($self, $res);
@@ -849,9 +855,9 @@ sub start_tls {
    	  sslv3 => 1,
   	  tlsv1 => 1,
   	);
-	  # key/cert
-	  $opt{key_file}  = $args->{tls_key} if ($args->{tls_key});
-	  $opt{cert_file} = $args->{tls_cert} if ($args->{tls_cert});
+	# key/cert
+	$opt{key_file}  = $args->{tls_key} if ($args->{tls_key});
+	$opt{cert_file} = $args->{tls_cert} if ($args->{tls_cert});
   	
   	# now really create context...
   	AnyEvent::TLS->new(%opt);
@@ -879,6 +885,7 @@ sub stop {
 
 sub test {
   my ($self, $id) = @_;
+  return 1;
   croak 'Method test is not implemented in ' . ref($self);
 }
 
@@ -927,7 +934,7 @@ sub _error {
   return unless my $c = $self->{_cs}->{$id};
 
   # Get error callback
-  my $cb = $c->{error_cb};
+  my $cb = $c->{on_error};
 
   # Cleanup
   $self->_drop_immediately($id);
@@ -937,6 +944,9 @@ sub _error {
   
   # run callback
   $cb->(undef, 1, $error) if ($cb);
+  $cb = $c->{on_hup};
+  weaken $self;
+  $cb->($self, $id) if ($cb);
 
 }
 
