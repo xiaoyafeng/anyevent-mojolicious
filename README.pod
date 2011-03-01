@@ -22,10 +22,12 @@ your app, think again. L<Mojolicious> has it all. Just
 and you can now use great HTTP L<client|Mojo::Client> and L<server|Mojo::Server::Daemon>
 implementation fully supporting B<IPv6>, B<HTTP/1.1> and B<TLS>.
 
-=head1 CURRENT LIMITATIONS:
+=head1 CURRENT STATUS/LIMITATIONS:
 
- * Mojo::Client doesn't work (at all!)
- * TLS works poorly (only server implementation currently works)
+ * Mojo::IOLoop emulation via AnyEvent::Mojolicious::IOLoop: mostly works, some minor issues 
+ * Mojo::Server::Daemon: works
+ * Mojo::Client works, but not all client tests succeed
+ * TLS support is not 100% finished, but mostly works :)
 
 =head1 SYNOPSIS
 
@@ -40,6 +42,7 @@ Put the following in B<myapp.pl>:
 
  get '/' => sub {
    my ($self) = @_;
+   	$self->render(data => "hello stranger from " .  $self->tx->remote_address);
  };
  
  # some AnyEvent stuff!
