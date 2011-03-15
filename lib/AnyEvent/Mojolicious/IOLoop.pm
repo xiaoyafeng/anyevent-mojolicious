@@ -1,18 +1,23 @@
 package AnyEvent::Mojolicious::IOLoop;
 
-use strict;
-use warnings;
+#use strict;
+#use warnings;
 
-use Carp 'carp';
+#use Carp 'carp';
+BEGIN {
 
 # is mojo::ioloop already loaded?
-if (exists($INC{'Mojo/IOLoop.pm'})) {
-  _unload('Mojo/IOLoop.pm');
+if (_loaded('Mojo::IOLoop')) {
+  print STDERR "Unloading real Mojo::IOLoop, installing fake one.\n";
+  if (defined $Mojo::IOLoop::LOOP) {
+    $Mojo::IOLoop::LOOP->stop();
+    undef $Mojo::IOLoop::LOOP;	
+  }
+  _unload2('Mojo::IOLoop');
 }
 else {
-
   # let's just pretend that we are THE Mojo::IOLoop :)
-  #print "Faking ioloop...\n";
+  print STDERR "Acting as the Mojo::IOLoop.\n";
 }
 
 # we are THE IOLoop :P
@@ -33,19 +38,78 @@ sub _unload {
   }
 }
 
-package Mojo::IOLoop;
+sub _unload2 {
+    #my ($self, $class) = @_;
+    my $class = shift;
+
+    return unless _loaded($class);
+
+    # Flush inheritance caches
+    @{$class . '::ISA'} = ();
+
+    my $symtab = $class.'::';
+    # Delete all symbols except other namespaces
+    for my $symbol (keys %$symtab) {
+        next if $symbol =~ /\A[^:]+::\z/;
+        delete $symtab->{$symbol};
+    }
+    
+    my $inc_file = join( '/', split /(?:'|::)/, $class ) . '.pm';
+    delete $INC{ $inc_file };
+    
+    return 1;
+}
+
+sub _loaded {
+	#my $class = shift;
+	my $name  = shift;
+
+	# Handle by far the two most common cases
+	# This is very fast and handles 99% of cases.
+	return 1 if defined ${"${name}::VERSION"};
+	return 1 if defined @{"${name}::ISA"};
+
+	# Are there any symbol table entries other than other namespaces
+	foreach ( keys %{"${name}::"} ) {
+		next if substr($_, -2, 2) eq '::';
+		return 1 if defined &{"${name}::$_"};
+	}
+
+	# No functions, and it doesn't have a version, and isn't anything.
+	# As an absolute last resort, check for an entry in %INC
+	my $filename = _inc_filename($name);
+	return 1 if defined $INC{$filename};
+
+	'';
+}
+
+# Create a INC-specific filename, which always uses '/'
+# regardless of platform.
+sub _inc_filename {
+#	my $class = shift;
+	my $name  = shift;#$class->_class(shift) or return undef;
+	join( '/', split /(?:\'|::)/, $name ) . '.pm';
+}
+}
+
+package
+ Mojo::IOLoop;
 
 use strict;
 use warnings;
 
 # omfg!
-no warnings 'redefine';
+#no warnings 'redefine';
+
+use Carp 'carp';
+
 
 use Carp 'croak';
 use File::Spec;
 use IO::File;
 use Scalar::Util qw(weaken refaddr blessed);
 
+use Socket;
 use AnyEvent;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
@@ -128,7 +192,7 @@ sub DESTROY {
   
   # drop on_idle
   for my $id (keys %{$self->{_idle}}) { $self->_drop_immediately($id) };
-  $self->{_idle_ae} = undef;
+  #$self->{_idle_ae} = undef;
   
   # drop on_tick
   for my $id (keys %{$self->{_tick}}) { $self->_drop_immediately($id) };
@@ -161,7 +225,7 @@ sub new {
 
   # on_idle callback subs
   $self->{_idle} = {};
-  $self->{_idle_ae} = undef;
+  #$self->{_idle_ae} = undef;
   
   # on_tick callback subs
   $self->{_tick} = {};
@@ -174,6 +238,7 @@ sub new {
 
 sub connect {
   my $self = shift;
+  $self = $self->singleton() unless (ref($self));
   my $args = ref $_[0] ? $_[0] : {@_};
   $args->{proto} ||= 'tcp';
 
@@ -215,12 +280,13 @@ sub connect {
           # connect failed?
           unless ($fh) {
           	print STDERR ref($self), " connect(): id $id: connect failed: $!\n" if DEBUG;
+#          	print STDERR ref($self), " connect(): id $id: connect failed: $!\n";
           	return $self->_error($id, $!);
           }
 
           print STDERR ref($self), " connect(): id $id: connect ok to $host port $port, fh $fh, retry: $retry\n" if DEBUG;
-          $conn->{host} = $host;
-          $conn->{port} = $port;
+          #$conn->{host} = $host;
+          #$conn->{port} = $port;
           $self->_handle_connect($id, $fh, $args);
   		},
   		# on_prepare
@@ -389,6 +455,7 @@ sub is_running { shift->{_running} }
 #  He is the cancer and I am the… uh… what cures cancer?"
 sub listen {
   my $self = shift;
+  $self = $self->singleton() unless (ref($self));
 
   # Arguments
   my $args = ref $_[0] ? $_[0] : {@_};
@@ -525,7 +592,7 @@ sub lookup {
 
 sub on_error {
   my ($self, $id, $cb) = @_;
-  #print STDERR ref($self), " on_error(): id $id => $cb\n" if DEBUG;
+  print STDERR ref($self), " on_error(): id $id => $cb\n" if DEBUG;
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   
@@ -558,7 +625,7 @@ sub on_error {
 
 sub on_hup {
   my ($self, $id, $cb) = @_;
-  # print STDERR ref($self), " on_hup(): id $id => $cb\n" if DEBUG;
+  print STDERR ref($self), " on_hup(): id $id => $cb\n" if DEBUG;
   #return unless (defined $cb && ref($cb) eq 'CODE');
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
@@ -594,12 +661,8 @@ sub on_idle {
   # save callback...
   my $id = refaddr($cb);
   $self->{_idle}->{$id} = $cb;
-  
-  # AE callback...
-  unless (defined $self->{_idle_ae}) {
-    $self->{_idle_ae} = AE::idle sub { $self->_do_on_idle() };
-  }
-  
+
+  $self->_install_on_tick();
   return $id;
 }
 
@@ -608,38 +671,36 @@ sub _do_on_idle {
 	print STDERR ref($self), " _do_on_idle(): Processing on_idle callbacks.\n" if DEBUG;
 	
 	# no on_idle callbacks?
+=pod
 	unless (%{$self->{_idle}}) {
 		# drop the goddamn idle callback from AE
 		print STDERR ref($self), " _do_on_idle(): No callbacks, removing AE on_idle registration.\n" if DEBUG;
 		$self->{_idle_ae} = undef;
 		return;
 	}
+=cut
 
 	# run callbacks...
 	weaken $self;
-	foreach (values %{$self->{_idle}}) { $_->($self) }	
+	my $i = 0;
+	foreach (values %{$self->{_idle}}) { $_->($self); $i++ }
+	return $i;	
 }
 
 sub _do_on_tick {
 	my $self = shift;
 	print STDERR ref($self), " _do_on_tick(): Processing on_tick callbacks\n" if DEBUG;
 	
-	# no on_tick callbacks?
-	unless (%{$self->{_tick}}) {
-		# drop the goddamn tick callback from AE
-		print STDERR ref($self), " _do_on_tick(): No callbacks, removing AE timer.\n" if DEBUG;		
-		$self->{_tick_ae} = undef;
-		return;
-	}
-	
 	# run on_tick callbacks
 	weaken $self;
-	foreach (values %{$self->{_tick}}) { $_->($self) }
+	my $i = 0;
+	foreach (values %{$self->{_tick}}) { $_->($self); $i++ }
+	return $i;
 }
 
 sub on_read {
   my ($self, $id, $cb) = @_;
-  #print STDERR ref($self), " on_read(): id $id => $cb\n" if DEBUG;  
+  print STDERR ref($self), " on_read(): id $id => $cb\n" if DEBUG;  
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   
@@ -675,20 +736,38 @@ sub on_tick {
   my $id = refaddr($cb);
   $self->{_tick}->{$id} = $cb;
   
+  $self->_install_on_tick();
+  
   # timeout?
   my $timeout = $self->timeout();
   return $id unless (defined $timeout && $timeout > 0);
 
-  # create AE timer to emulate timer ticks...
-  unless (defined $self->{_tick_ae}) {
-    $self->{_tick_ae} = AE::timer(
-    	0.01,
-    	$timeout,
-    	sub { $self->_do_on_tick() }
-    );
-  }
-
   return $id;
+}
+
+sub _install_on_tick {
+  my ($self) = @_;
+
+  unless (defined $self->{_tick_ae}) {
+  	return unless (%{$self->{_tick}} || %{$self->{_idle}});
+  	return unless $self->is_running;
+  	
+  	weaken $self;
+  	$self->{_tick_ae} = AE::timer(
+  		0.001,
+  		$self->timeout(),
+  		sub {
+  		  my $num_idle = $self->_do_on_idle();
+  		  my $num_tick = $self->_do_on_tick();
+
+  		  # nothing done? drop on_tick timer
+  		  if ($num_idle == 0 && $num_tick == 0) {
+  		  	print STDERR ref($self), " Removing _tick_ae\n" if (DEBUG);
+  		  	delete($self->{_tick_ae});
+  		  }
+  		}
+  	)
+  }
 }
 
 sub one_tick {
@@ -717,16 +796,27 @@ sub handle {
   };
 }
 
-sub local_info { remote_info(@_) }
+sub local_info {
+  my ($self, $id) = @_;
+  return {} unless my $c = $self->{_cs}->{$id};
+  return {} unless (ref($c) eq 'HASH' && $c->{h});
+  my $fh = $c->{h}->fh;
+  return {} unless $fh;
+  my $sockaddr = getsockname($fh);
+  my ($port, $iaddr) = AnyEvent::Socket::unpack_sockaddr($sockaddr);
+  my $address = AnyEvent::Socket::ntoa($iaddr);
+  return { address => $address, port => $port};
+}
 sub remote_info {
   my ($self, $id) = @_;
   return {} unless my $c = $self->{_cs}->{$id};
   return {} unless (ref($c) eq 'HASH' && $c->{h});
-
-  return {
-  	address => $c->{address},
-  	port => $c->{port}
-  };
+  my $fh = $c->{h}->fh;
+  return {} unless $fh;
+  my $sockaddr = getpeername($fh);
+  my ($port, $iaddr) = AnyEvent::Socket::unpack_sockaddr($sockaddr);
+  my $address = AnyEvent::Socket::ntoa($iaddr);
+  return { address => $address, port => $port};
 }
 
 sub resolve {
@@ -799,23 +889,32 @@ sub singleton { $LOOP ||= shift->new(@_) }
 
 sub start {
   my $self = shift;
-  return unless (defined $self);
-  return if ($self->{_running} || $self->{_cv});
+  $self = $self->singleton() unless (ref($self));
+
+  if ($self->{_running} || $self->{_cv}) {
+  	print STDERR ref($self), " start(): Already running, returning immediately.\n" if DEBUG;
+  	return;
+  }
+
+  # we're now running
+  $self->{_running} = 1;
   
-  unless (%{$self->{_cs}} || $self->{_dns_lookups}) {
+  $self->_install_on_tick();
+  
+  unless (%{$self->{_cs}} || $self->{_dns_lookups} || %{$self->{_tick}} || %{$self->{_idle}}) {
   	print STDERR ref($self), " start(): No handles to watch, returning immediately.\n" if DEBUG;
   	return;
   }
   
+  
+  $self->_install_on_tick;
+
   print STDERR ref($self), " start(): Creating condvar\n" if DEBUG;
 
 # create condvar...
 # TODO: beware of this monster!
 # http://search.cpan.org/~mlehmann/AnyEvent-5.31/lib/AnyEvent/FAQ.pod#Why_do_some_backends_use_a_lot_of_CPU_in_AE::cv->recv?
   $self->{_cv} = AnyEvent->condvar();
-
-  # we're now running
-  $self->{_running} = 1;
 
   # wait for completion...
   $self->{_cv}->recv();
@@ -875,9 +974,11 @@ sub start_tls {
 
 sub stop {
   my ($self) = @_;
+  $self = $self->singleton() unless (ref($self));
   return unless ($self->{_running} || defined $self->{_cv});
 
   print STDERR ref($self), " stop(): stopping loop $self\n" if DEBUG;
+  $self->{_tick_ae} = undef;
   $self->{_cv}->send() if (defined $self->{_cv});
   #$self->{_cv} = undef;
   $self->{_running} = 0;
@@ -891,9 +992,24 @@ sub test {
 
 sub timer {
   my ($self, $after, $cb) = @_;
+  $self = $self->singleton() unless (ref($self));
+  return unless (defined $cb && ref($cb) eq 'CODE');
   weaken $self;
-  my $t = AE::timer($after, 0, sub { $cb->($self) });
-  my $id = refaddr($t);
+  my $id = undef;
+  
+  # create timer...
+  my $t = AE::timer(
+  	$after, 0,
+  	sub {
+  		# remove timer
+  		delete($self->{_id}->{$id});
+  		# invoke callback...
+  		$cb->($self);
+  	}
+  );
+  
+  # compute real id
+  $id = refaddr($t);
 
   # save it...
   $self->{_cs}->{$id} = $t;
@@ -927,6 +1043,8 @@ sub write {
   return $self;
 }
 
+sub _is_ae { 1 }
+
 sub _error {
   my ($self, $id, $error) = @_;
 
@@ -947,7 +1065,6 @@ sub _error {
   $cb = $c->{on_hup};
   weaken $self;
   $cb->($self, $id) if ($cb);
-
 }
 
 sub _prepare_cert {
