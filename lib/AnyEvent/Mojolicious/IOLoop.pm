@@ -1,14 +1,13 @@
 package AnyEvent::Mojolicious::IOLoop;
 
-#use strict;
-#use warnings;
+use constant DEBUG => $ENV{MOJO_IOLOOP_DEBUG} || 0;
 
 #use Carp 'carp';
 BEGIN {
 
 # is mojo::ioloop already loaded?
 if (_loaded('Mojo::IOLoop')) {
-  print STDERR "Unloading real Mojo::IOLoop, installing fake one.\n";
+  print STDERR "Unloading real Mojo::IOLoop, installing fake one.\n" if DEBUG;
   if (defined $Mojo::IOLoop::LOOP) {
     $Mojo::IOLoop::LOOP->stop();
     undef $Mojo::IOLoop::LOOP;	
@@ -17,7 +16,7 @@ if (_loaded('Mojo::IOLoop')) {
 }
 else {
   # let's just pretend that we are THE Mojo::IOLoop :)
-  print STDERR "Acting as the Mojo::IOLoop.\n";
+  print STDERR "Acting as the Mojo::IOLoop.\n" if DEBUG;
 }
 
 # we are THE IOLoop :P
