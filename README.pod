@@ -48,13 +48,8 @@ Put the following in B<myapp.pl>:
  # some AnyEvent stuff!
  get '/ae' => sub {
    my $self = shift;
-   # already loaded, this is for demonstration
-   # purposes only, so that you can run
-   # this app under normal mojo server daemon to
-   # find out that /ae location just doesn't return
-   # any output :>
-   require AnyEvent;
- 	
+   # AnyEvent and AE are already loaded...
+
    my $delay = rand(1.3);
  	
    # delay response using AnyEvent timer:
