@@ -3,10 +3,11 @@ package AnyEvent::Mojolicious;
 use strict;
 use warnings;
 
-no warnings 'redefine';
+#no warnings 'redefine';
 
 # load the ioloop
 use AnyEvent::Mojolicious::IOLoop;
+use Mojo::Server::DaemonAnyevent;
 
 our $VERSION = 0.10;
 
