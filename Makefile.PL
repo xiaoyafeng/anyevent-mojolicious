@@ -13,6 +13,8 @@ WriteMakefile(
     PL_FILES            => {},
     PREREQ_PM => {
         'Test::More' => 0,
+        'AnyEvent'   => 5.3,
+        'Mojolicious'=> 1.0,
     },
     test => {TESTS => 't/*.t t/*/*.t'},
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },

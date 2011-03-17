@@ -9,7 +9,7 @@ use it in your Mojo apps :)
 
 =head1 Why should i care?
 
-Becouse you want (maybe you don't even know) to use all those goodies
+Because you want (maybe you don't even know) to use all those goodies
 that come with L<AnyEvent> (TLS, IPv6 support, lots of modules) in your
 L<Mojolicious> webapp.
 
