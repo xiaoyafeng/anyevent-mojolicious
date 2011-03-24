@@ -93,7 +93,127 @@ TODO
 
 TODO
 
+=head1 PERFORMANCE
+
+Simple benchmark was done using L<ab(8)> with simple L<Mojo::Server::Daemon> with
+L<Mojolicious::Lite> hello world application.
+
+B<Application:>
+
+ get '/' => sub {
+	my $self = shift;
+	$self->render(data => "hello stranger a from " .  $self->tx->remote_address);
+ };
+
+B<Test command:>
+
+ /usr/sbin/ab2 -n 20000 -c 100 -k http://127.0.0.1:3000/
+
+Test was performed with L<AnyEvent> version 5.31 powered by L<EV> version 4.03
+on Linux i386 using perl 5.12.1. Mojo stock ioloop was powered by L<IO::Epoll>
+version 0.02.
+
+B<Mojo::IOLoop> results:
+
+ Keep-Alive requests:    19212
+ Total transferred:      4636287 bytes
+ HTML transferred:       620031 bytes
+ Requests per second:    846.58 [#/sec] (mean)
+ Time per request:       118.123 [ms] (mean)
+ Time per request:       1.181 [ms] (mean, across all concurrent requests)
+ Transfer rate:          191.65 [Kbytes/sec] received
+ 
+ Connection Times (ms)
+              min  mean[+/-sd] median   max
+ Connect:        0    0   0.1      0       3
+ Processing:     4  114 424.6     29    2606
+ Waiting:        4  113 424.7     29    2606
+ Total:          4  114 424.6     29    2608
+ 
+ Percentage of the requests served within a certain time (ms)
+  50%     29
+  66%     30
+  75%     31
+  80%     31
+  90%     32
+  95%     35
+  98%   2258
+  99%   2282
+  100%  2608 (longest request)
+
+B<AnyEvent::Mojolicious::IOLoop> results:
+
+ Keep-Alive requests:    19200
+ Total transferred:      4454400 bytes
+ HTML transferred:       595200 bytes
+ Requests per second:    850.63 [#/sec] (mean)
+ Time per request:       117.560 [ms] (mean)
+ Time per request:       1.176 [ms] (mean, across all concurrent requests)
+ Transfer rate:          185.01 [Kbytes/sec] received
+ 
+ Connection Times (ms)
+              min  mean[+/-sd] median   max
+ Connect:        0    0   0.1      0       3
+ Processing:    17  117  10.4    116     246
+ Waiting:        0  113  25.0    115     246
+ Total:         18  117  10.3    116     246
+ 
+ Percentage of the requests served within a certain time (ms)
+  50%    116
+  66%    117
+  75%    119
+  80%    120
+  90%    123
+  95%    126
+  98%    135
+  99%    159
+  100%   246 (longest request)
+
+So performance is almost the same, except that AnyEvent version of IOLoop
+has higher, but also more stable latency under high load.
+
 =head1 LIMITATIONS
+
+=over
+
+=item listen
+
+L<Mojo::IOLoop/listen> method doesn't support resolving DNS names to IP addresses.
+
+ ./app daemon_anyevent --listen http://localhost:7000 # doesn't work
+ 
+ ./app daemon_anyevent --listen http://127.0.0.1:7000 # works
+ ./app daemon_anyevent --listen http://[::1]:7000     # works
+
+=item lookup, resolve
+
+Async DNS resolver is implemented using L<AnyEvent::DNS> module, which doesn't
+report dns entry TTL value. Returned TTL is always 3600 seconds!
+
+=item start method behaviour
+
+According to IOLoop API L<Mojo::IOLoop/start> method should block if timeout is set to
+non-zero value. This is impossible to achieve in running AnyEvent program without
+blocking entire process.
+
+
+Start method B<doesn't> block and returns immediately if it thinks that is invoked
+in already running AnyEvent loop.
+
+=item stop method behaviour
+
+There is also no way to freeze i/o events to happen
+and on_read/on_error/on_hup callbacks to be invoked without dropping handles - stop
+method doesn't really stop the ioloop, even though start method returns immediately
+after stop is invoked.
+
+=item timeout, on_idle, on_tick, one_tick handling
+
+L<Mojo::IOLoop/on_tick> and L<Mojo::IOLoop/on_idle> and L<Mojo::IOLoop/one_tick> are
+emulated using repeating timer (using L<AE/timer>). AnyEvent doesn't have concept of
+ticks in public API, that's why this behaviour must be emulated.
+
+=back
 
 =head1 SEE ALSO
 
@@ -110,10 +230,8 @@ package Mojo::IOLoop;
 use strict;
 use warnings;
 
-use Carp 'carp';
+use Carp qw(carp croak);
 
-
-use Carp 'croak';
 use File::Spec;
 use IO::File;
 use Scalar::Util qw(weaken refaddr blessed);
@@ -240,8 +358,9 @@ sub new {
   $self->{_tick}    = {};
   $self->{_tick_ae} = undef;
 
-  # Ignore PIPE signal
-  $SIG{PIPE} = 'IGNORE';
+  # Ignore PIPE signal (installed by AnyEvent by default)
+  # $SIG{PIPE} = 'IGNORE';
+
   return $self;
 }
 
@@ -419,11 +538,14 @@ sub listen {
   croak "AnyEvent::TLS required for TLS support"
     if $args->{tls} && !TLS;
 
+  # no on_accept?
+  unless (defined $args->{on_accept} && ref($args->{on_accept}) eq 'CODE') {
+    croak "Undefined on_accept argument.";
+    return;
+  }
 
-  my $listen = {
-    g => undef,
-    h => undef,
-  };
+  # create listener structure...
+  my $listen = {g => undef, h => undef};
   my $id = refaddr($listen);
   $self->{_cs}->{$id} = $listen;
 
@@ -449,99 +571,78 @@ sub listen {
       " listen(): id $id will listen on addr = '$addr', port = '$port'\n";
   }
 
-  my $on_accept = delete($args->{on_accept}) || undef;
+  # unix domain socket?
+  if ($addr eq 'unix/') {
+    $self->_listener_create($id, $args, $addr, $port);
+    return $id;
+  }
 
-  #unless (ref($on_accept) eq 'CODE') {
-  #  croak "No on_accept defined!";
-  #  return;
-  #}
-
-  # create tcp server
-  $listen->{g} = tcp_server(
+  # resolve $addr and create listener(s)
+  AnyEvent::DNS::any(
     $addr,
-    $port,
-
-    # accept cb
     sub {
 
-      # TODO: handle max_accepts!
-      my ($fh, $host, $port) = @_;
-      print STDERR ref($self),
-        " listen() accepted on $id: $fh, $host, $port\n"
-        if DEBUG;
+      # was anything resolved?
+      unless (@_) {
 
-      # time to create client handle!
-      my $ch = AnyEvent::Handle->new(fh => $fh, no_delay => 1);
-      my $cid = refaddr($ch);
-
-      # save handle
-      $self->{_cs}->{$cid} = {h => $ch, address => $host, port => $port};
-
-      print STDERR ref($self), " listen(): Created new connection id $cid\n"
-        if DEBUG;
-
-      # apply callbacks
-      for my $name (qw/error hup read/) {
-        my $cb    = $args->{"on_$name"};
-        my $event = "on_$name";
-        $self->$event($cid => $cb) if $cb;
+        # try to create listener with $addr
+        return $self->_listener_create($id, $args, $addr, $port);
       }
 
-      # TLS?
-      if ($args->{tls}) {
-        $ch->on_starttls(
-          sub {
-            my ($hdl, $ok, $err) = @_;
-            unless ($ok) {
-              $self->_error($id, $err);
-              return;
-            }
-            if ($on_accept) {
-              print STDERR ref($self),
-                " listen() id $id: on_starttls $on_accept\n"
-                if DEBUG;
-              $on_accept->($self, $id);
-            }
-          }
-        );
+      my @resolved_addrs = ();
+      foreach my $e (@_) {
+        next
+          unless (defined $e->[1] && ($e->[1] eq 'aaaa' || $e->[1] eq 'a'));
 
-        # no certificates?
-        $args->{tls_cert} = $self->_prepare_cert()
-          unless ($args->{tls_cert});
-        $args->{tls_key} = $self->_prepare_key()
-          unless ($args->{tls_key});
-
-        # get TLS context
-        local $@;
-        my $ctx = eval { $self->_get_tls_ctx($args) };
-        if ($@) {
-        	return $self->_error($cid, "Error creating TLS context: $@");
-        }
-
-        $ch->starttls('accept', $ctx);
-
-        # fire on_accept handler!
-        if ($on_accept) {
-          print STDERR ref($self),
-            " listen(): firing on_accept callback for id $cid\n"
-            if DEBUG;
-          $on_accept->($self, $cid);
-        }
+        # get resolved address...
+        push(@resolved_addrs, $e->[3]);
       }
-      else {
-        $on_accept->($self, $cid);
+
+      # ok, create listener for all resolved addresses...
+      foreach (@resolved_addrs) {
+        $self->_listener_create($id, $args, $_, $port);
       }
     },
-
-    # prepare cb
-    sub {
-      my ($fh, $host, $port) = @_;
-      $self->{_cs}->{$id}->{address} = $host;
-      $self->{_cs}->{$id}->{port}    = $port;
-    }
   );
 
+  # just return goddamn id...
   return $id;
+}
+
+sub _listener_create {
+  my ($self, $id, $args, $addr, $port) = @_;
+
+  my $listen = $self->{_cs}->{$id};
+  return unless (defined $listen);
+  print STDERR ref($self,),
+    " _listener_create(): id $id, creating listener addr = '$addr', port = '$port'\n"
+    if (DEBUG);
+
+  # create tcp server
+  local $@;
+  $listen->{g} = eval {
+    tcp_server(
+      $addr,
+      $port,
+
+      # accept cb
+      sub { $self->_handle_accept($id, $args, @_) },
+
+      # prepare cb
+      sub {
+        my ($fh, $host, $port) = @_;
+        $self->{_cs}->{$id}->{address} = $host;
+        $self->{_cs}->{$id}->{port}    = $port;
+      }
+    );
+  };
+
+  # check for tcp_server injuries
+  if ($@) {
+    croak "Exception while creating listener: $@";
+    $self->_error($id);
+    return;
+  }
 }
 
 sub lookup {
@@ -703,7 +804,7 @@ sub one_tick {
   # There is no "one_tick" concept in AnyEvent API.
 
   # well, however, let's just run on_tick
-  # on_idle callbacks...
+  # and on_idle callbacks...
   $self->_do_on_tick();
   $self->_do_on_idle();
 }
@@ -711,16 +812,19 @@ sub one_tick {
 sub handle {
   my ($self, $id, $raw) = @_;
   $raw = 0 unless (defined $raw);
+  print STDERR "AAAAAAAAAAAAAAAAwants handle for id $id\n";
   return unless my $c = $self->{_cs}->{$id};
   return unless (ref($c) eq 'HASH' && $c->{h});
 
   my $fh = $c->{h}->fh();
   return $fh if ($raw);
   local $@;
-  eval {
+  print STDERR "H id $id => $fh\n";
+  my $h = eval {
     require IO::Socket::INET;
     IO::Socket::INET->new_from_fd(fileno($fh), 'r+');
   };
+  return $h;
 }
 
 sub local_info {
@@ -821,6 +925,11 @@ sub start {
   my $self = shift;
   $self = $self->singleton() unless (ref($self));
 
+  my $ae_model = $AnyEvent::MODEL;
+  print STDERR ref($self), " start(): AnyEvent uses model: '$ae_model'\n"
+    if DEBUG && defined $ae_model;
+
+
   if ($self->{_running} || $self->{_cv}) {
     print STDERR ref($self),
       " start(): Already running, returning immediately.\n"
@@ -831,8 +940,10 @@ sub start {
   # we're now running
   $self->{_running} = 1;
 
+  # install on_tick and on_idle repeating timers...
   $self->_install_on_tick();
 
+  # nothing to watch for?
   unless (%{$self->{_cs}}
     || $self->{_dns_lookups}
     || %{$self->{_tick}}
@@ -844,10 +955,21 @@ sub start {
     return;
   }
 
+  # ioloop timeout?
+  my $to = $self->timeout();
+  unless (defined $to && $to > 0) {
+    print STDERR ref($self),
+      " start(): Zero timeout value, returning immediately.\n"
+      if DEBUG;
+    return;
+  }
 
-  $self->_install_on_tick;
 
-  print STDERR ref($self), " start(): Creating condvar\n" if DEBUG;
+  # $self->_install_on_tick;
+
+  print STDERR ref($self),
+    " start(): Creating condvar, starting ioloop in blocking mode.\n"
+    if DEBUG;
 
 # create condvar...
 # TODO: beware of this monster!
@@ -939,6 +1061,7 @@ sub timer {
   my $t = AE::timer(
     $after, 0,
     sub {
+
       # remove timer
       delete($self->{_id}->{$id});
 
@@ -957,14 +1080,13 @@ sub timer {
 
 sub write {
   my ($self, $id, $chunk, $cb) = @_;
-  print STDERR ref($self), " write(): Writing data to id $id, cb='$cb'.\n"
-    if DEBUG;
+  if (DEBUG) {
+    no warnings;
+    print STDERR ref($self), " write(): Writing data to id $id, cb='$cb'.\n";
+  }
   return unless (exists $self->{_cs}->{$id});
   my $h = $self->{_cs}->{$id}->{h};
   return unless (defined $h);
-
-  print STDERR ref($self), " write(): Writing data to id $id.\n" if DEBUG;
-
 
   # add chunk for writing...
   $h->push_write($chunk);
@@ -974,6 +1096,7 @@ sub write {
     weaken $self;
     $h->on_drain(
       sub {
+
         # remove on_drain cb on handle...
         $_[0]->on_drain(undef);
 
@@ -1126,21 +1249,21 @@ sub _get_tls_ctx {
       $opt{verify_cb} = sub {
         my ($tls, $ref, $cn, $depth, $preverify_ok, $x509_store_ctx, $cert) =
           @_;
-        print STDERR "VERIFY_CB called\n";
+        print STDERR ref($self), " tls_verify cb called!\n" if (DEBUG);
 
-=pod
-If you want to verify certificates yourself, you can pass a sub reference along with this parameter to do so. When the callback is called, it will be passed: 
-1. a true/false value that indicates what OpenSSL thinks of the certificate,
-2. a C-style memory address of the certificate store,
-3. a string containing the certificate's issuer attributes and owner attributes, and
-4. a string containing any errors encountered (0 if no errors).
-5. a C-style memory address of the peer's own certificate (convertible to PEM form with Net::SSLeay::PEM_get_string_X509()).
-
-
- The function should return 1 or 0, depending on whether it thinks the certificate is valid or invalid. The default is to let OpenSSL do all of the busy work. 
-
- The callback will be called for each element in the certificate chain. 
-=cut
+# from perldoc IO::Socket::SSL:
+#
+#If you want to verify certificates yourself, you can pass a sub reference along with this parameter to do so. When the callback is called, it will be passed:
+#1. a true/false value that indicates what OpenSSL thinks of the certificate,
+#2. a C-style memory address of the certificate store,
+#3. a string containing the certificate's issuer attributes and owner attributes, and
+#4. a string containing any errors encountered (0 if no errors).
+#5. a C-style memory address of the peer's own certificate (convertible to PEM form with Net::SSLeay::PEM_get_string_X509()).
+#
+#
+# The function should return 1 or 0, depending on whether it thinks the certificate is valid or invalid. The default is to let OpenSSL do all of the busy work.
+#
+# The callback will be called for each element in the certificate chain.
 
         # return user-provided callback result
         return $args->{tls_verify}->(
@@ -1222,19 +1345,8 @@ sub _handle_connect {
   # create AnyEvent::Handle
   my $aeh = AnyEvent::Handle->new(fh => $fh);
 
-  #$self->{_cs}->{$id}->{h} = $aeh;
+  # add handle...
   $self->_handle_add($id, $aeh);
-
-=pod
-  $aeh->timeout($self->connection_timeout());
-
-  # register callbacks
-  for my $name (qw/error hup read/) {
-    my $cb    = $args->{"on_$name"};
-    my $event = "on_$name";
-    $self->$event($id => $cb);
-  }
-=cut
 
   weaken $self;
   my $on_connect = $args->{on_connect};
@@ -1271,6 +1383,81 @@ sub _handle_connect {
   }
 }
 
+sub _handle_accept {
+  my ($self, $id, $args, $fh, $host, $port) = @_;
+
+  # TODO: handle max_connections
+  # TODO: handle max_accepts
+
+  print STDERR ref($self), " listen() accepted on $id: $fh, $host, $port\n"
+    if DEBUG;
+
+  my $on_accept = $args->{on_accept};
+
+  # time to create client handle!
+  my $ch = AnyEvent::Handle->new(fh => $fh, no_delay => 1);
+  my $cid = refaddr($ch);
+
+  # save handle
+  $self->{_cs}->{$cid} = {h => $ch, address => $host, port => $port};
+
+  print STDERR ref($self), " listen(): Created new connection id $cid\n"
+    if DEBUG;
+
+  # apply callbacks
+  for my $name (qw/error hup read/) {
+    my $cb    = $args->{"on_$name"};
+    my $event = "on_$name";
+    $self->$event($cid => $cb) if $cb;
+  }
+
+  # TLS?
+  if ($args->{tls}) {
+    $ch->on_starttls(
+      sub {
+        my ($hdl, $ok, $err) = @_;
+        unless ($ok) {
+          $self->_error($cid, $err);
+          return;
+        }
+        if ($on_accept) {
+          print STDERR ref($self),
+            " listen() id $id: on_starttls $on_accept\n"
+            if DEBUG;
+          $on_accept->($self, $id);
+        }
+      }
+    );
+
+    # no certificates?
+    $args->{tls_cert} = $self->_prepare_cert()
+      unless ($args->{tls_cert});
+    $args->{tls_key} = $self->_prepare_key()
+      unless ($args->{tls_key});
+
+    # get TLS context
+    local $@;
+    my $ctx = eval { $self->_get_tls_ctx($args) };
+    if ($@) {
+      return $self->_error($cid, "Error creating TLS context: $@");
+    }
+
+    $ch->starttls('accept', $ctx);
+
+    # fire on_accept handler!
+    if ($on_accept) {
+      print STDERR ref($self),
+        " listen(): firing on_accept callback for id $cid\n"
+        if DEBUG;
+      $on_accept->($self, $cid);
+    }
+  }
+  else {
+    $on_accept->($self, $cid);
+  }
+
+}
+
 sub _install_on_tick {
   my ($self) = @_;
 
@@ -1278,10 +1465,12 @@ sub _install_on_tick {
     return unless (%{$self->{_tick}} || %{$self->{_idle}});
     return unless $self->is_running;
 
+    my $to = $self->timeout();
+    return unless (defined $to && $to > 0);
+
     weaken $self;
     $self->{_tick_ae} = AE::timer(
-      0.001,
-      $self->timeout(),
+      0.001, $to,
       sub {
         my $num_idle = $self->_do_on_idle();
         my $num_tick = $self->_do_on_tick();
