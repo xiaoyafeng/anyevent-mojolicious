@@ -5,13 +5,14 @@ use warnings;
 
 use Scalar::Util qw(weaken);
 
+use AnyEvent;
 use AnyEvent::Mojolicious::IOLoop;
 
 use base 'Mojo::Server::Daemon';
 
 =head1 NAME
 
-AnyEvent based version of L<Mojo::Server::Daemon>
+AnyEvent powered version of L<Mojo::Server::Daemon>
 
 =head1 DESCRIPTION
 
@@ -38,6 +39,9 @@ sub new {
 
 sub run {
   my $self = shift;
+  
+  my $ae_model = $AnyEvent::MODEL;
+  #print "AE model: '$ae_model'\n";
 
   # Prepare ioloop
   $self->prepare_ioloop;
@@ -47,9 +51,11 @@ sub run {
 
   # no signal handlers will be set
   
-  my $l = $self->ioloop;
-  
-  $l->{_running} = 1;
+  # do we have non-virgin ioloop?
+  if (defined $ae_model) {
+  	# make ioloop start non-blocking
+  	$self->ioloop()->{_running} = 1;
+  }
 
   # Start loop
   $self->ioloop->start;
