@@ -25,9 +25,30 @@ Great Mojolicious features worth including in your anyevent program:
 
 =over
 
-=item L<TLS, IPv6 and websocket capable HTTP/1.1 server|Mojo::Server::Daemon>
+=item L<Mojo::Server::Daemon - TLS, IPv6 and websocket capable HTTP/1.1 server|Mojo::Server::Daemon>
 
-=item L<TLS, IPv6 and websocket capable HTTP/1.1 client|Mojo::UserAgent>
+=item L<Mojo::UserAgent - TLS, IPv6 and websocket capable HTTP/1.1 client|Mojo::UserAgent>
+
+=item L<Mojo::DOM - Very fun and minimalistic XML/HTML5 DOM parser with CSS3 selector support|Mojo::DOM>
+
+=back
+
+Great AnyEvent features worth including in your Mojolicious apps:
+
+=over
+
+=item Async database access
+
+L<AnyEvent::BDB>, L<AnyEvent::CouchDB>, L<AnyEvent::MongoDB>, L<AnyMongo>, L<AnyEvent::Memcached>,
+L<AnyEvent::DBD::Pg>
+
+=item Integrate truly async IO
+
+L<AnyEvent::AIO>
+
+=item Stable IPv6 and TLS support
+
+L<AnyEvent::Socket>, L<AnyEvent::TLS>
 
 =back
 
@@ -112,6 +133,12 @@ Run your webapp with daemon_anyevent server mode:
 
  $ ./webapp.pl daemon_anyevent 
 
+=head1 LIMITATIONS
+
+This module does it's best to implement Mojolicious support by emulating 
+functionality of L<Mojo::IOLoop>. Most stuff works, but there are
+L<some LIMITATIONS|AnyEvent::Mojolicious::IOLoop/LIMITATIONS>.
+
 =head1 SEE ALSO
 
 =over
@@ -125,6 +152,8 @@ L<Mojo::IOLoop> re-implementation powered by L<AnyEvent>.
 L<Mojo::Server::Daemon> extension.
 
 =item L<Mojolicious>
+
+=item L<Mojolicious::Guides>
 
 =item L<AnyEvent>
 
